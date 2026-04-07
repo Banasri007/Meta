@@ -1,3 +1,15 @@
+---
+title: FinOps Cloud Optimizer
+emoji: ☁️
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
+
+
 # FinOps Agent Environment (OpenEnv)
 
 This repository provides a simulated cloud cost optimization environment where an agent must reduce spend without harming production reliability.
