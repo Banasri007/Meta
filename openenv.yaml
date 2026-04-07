@@ -1,0 +1,29 @@
+spec_version: "1.0"
+name: "finops-optimizer"
+version: "0.1.0"
+description: "A real-world simulation for cloud cost optimization (FinOps)."
+tags:
+  - "finops"
+  - "cloud-cost"
+  - "optimization"
+  - "rl-environment"
+runtime: "python"
+entrypoint: "main:app"
+port: 7860
+
+# Define the 3 required tasks
+tasks:
+  - id: "cleanup_unattached"
+    name: "The Garbage Collector"
+    difficulty: "easy"
+    description: "Delete 5 unattached storage volumes and 2 idle test instances."
+    
+  - id: "rightsize_compute"
+    name: "The Right-Sizer"
+    difficulty: "medium"
+    description: "Downgrade underutilized VMs to smaller types while keeping latency < 200ms."
+    
+  - id: "fleet_strategy"
+    name: "The Budget Strategist"
+    difficulty: "hard"
+    description: "Balance deletions, rightsizing, and savings plans for high ROI without downtime."
