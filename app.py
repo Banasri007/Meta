@@ -82,7 +82,7 @@ HTML_TEMPLATE = """
         function App() {
             const [task, setTask] = useState('task1');
             const [tab, setTab] = useState('manual');
-            const [action, setAction] = useState(JSON.stringify({action_type: 'delete_resource', resource_id: 'i-0abc123'}, null, 2));
+            const [action, setAction] = useState(JSON.stringify({action_type: 'delete_resource', resource_id: ''}, null, 2));
             const [status, setStatus] = useState({ text: '', type: 'info' });
             const [response, setResponse] = useState(null);
             const [loading, setLoading] = useState(false);
@@ -90,14 +90,55 @@ HTML_TEMPLATE = """
             const [taskScore, setTaskScore] = useState(0);
 
             const taskDescriptions = {
-                task1: "Task 1: Reduce EC2 Costs. Delete unused compute resources.",
-                task2: "Task 2: Optimize Storage. Modify storage tier to cheaper options.",
-                task3: "Task 3: Maximize Savings. Purchase reserved capacity plans."
+                task1: "Task 1 (Easy): Delete unattached volumes and idle test instances.",
+                task2: "Task 2 (Medium): Right-size underutilized compute instances.",
+                task3: "Task 3 (Hard): Combine deletes, right-sizing, and savings plans."
             };
             const taskIdMap = {
                 task1: "cleanup_unattached",
                 task2: "rightsize_compute",
                 task3: "fleet_strategy"
+            };
+
+            const defaultActionByTask = {
+                task1: { action_type: "delete_resource", resource_id: "" },
+                task2: { action_type: "modify_instance", instance_id: "", new_type: "t3.small" },
+                task3: { action_type: "purchase_savings_plan", plan_type: "compute", duration: "1y" }
+            };
+
+            const suggestNextAction = (currentTask, observation) => {
+                const inventory = observation?.inventory || [];
+                if (!inventory.length) return defaultActionByTask[currentTask];
+
+                if (currentTask === "task1") {
+                    const unattached = inventory.find(r => r.category === "storage" && !r.is_attached);
+                    if (unattached) return { action_type: "delete_resource", resource_id: unattached.id };
+                    const idleTest = inventory.find(r => r.category === "compute" && r?.tags?.lifecycle === "idle");
+                    if (idleTest) return { action_type: "delete_resource", resource_id: idleTest.id };
+                    return defaultActionByTask[currentTask];
+                }
+
+                if (currentTask === "task2") {
+                    const underutilized = inventory.find(
+                        r => r.category === "compute" && Number(r.cpu_usage_pct_30d || 0) < 5.0 && r.resource_type !== "t3.small"
+                    );
+                    if (underutilized) {
+                        return { action_type: "modify_instance", instance_id: underutilized.id, new_type: "t3.small" };
+                    }
+                    return defaultActionByTask[currentTask];
+                }
+
+                const legacyNonProd = inventory.find(r => r.is_legacy && !r.is_production);
+                if (legacyNonProd) return { action_type: "delete_resource", resource_id: legacyNonProd.id };
+                const unattached = inventory.find(r => r.category === "storage" && !r.is_attached);
+                if (unattached) return { action_type: "delete_resource", resource_id: unattached.id };
+                const idleTest = inventory.find(r => r.category === "compute" && r?.tags?.lifecycle === "idle");
+                if (idleTest) return { action_type: "delete_resource", resource_id: idleTest.id };
+                const underutilized = inventory.find(
+                    r => r.category === "compute" && Number(r.cpu_usage_pct_30d || 0) < 5.0 && r.resource_type !== "t3.small"
+                );
+                if (underutilized) return { action_type: "modify_instance", instance_id: underutilized.id, new_type: "t3.small" };
+                return defaultActionByTask[currentTask];
             };
 
             const fetchTaskScore = async (currentTask = task) => {
@@ -124,27 +165,41 @@ HTML_TEMPLATE = """
                     if (!resp.ok) throw new Error(data?.detail || `API error: ${resp.status}`);
                     setResponse(data);
                     setStatus({ text: 'Success ✓', type: 'success' });
+                    return data;
                 } catch (err) {
                     console.error(err);
                     setStatus({ text: `Error: ${err.message}`, type: 'error' });
                     setResponse(null);
+                    return null;
                 } finally {
                     setLoading(false);
                 }
             };
 
             const handleReset = async () => {
-                await apiCall('POST', '/reset');
+                const data = await apiCall('POST', '/reset');
+                if (data?.observation) {
+                    const nextAction = suggestNextAction(task, data.observation);
+                    setAction(JSON.stringify(nextAction, null, 2));
+                }
                 await fetchTaskScore();
             };
             const handleState = async () => {
-                await apiCall('GET', '/state');
+                const data = await apiCall('GET', '/state');
+                if (data?.observation) {
+                    const nextAction = suggestNextAction(task, data.observation);
+                    setAction(JSON.stringify(nextAction, null, 2));
+                }
                 await fetchTaskScore();
             };
             const handleStep = async () => {
                 try {
                     const parsed = JSON.parse(action);
-                    await apiCall('POST', '/step', parsed);
+                    const data = await apiCall('POST', '/step', parsed);
+                    if (data?.observation) {
+                        const nextAction = suggestNextAction(task, data.observation);
+                        setAction(JSON.stringify(nextAction, null, 2));
+                    }
                     await fetchTaskScore();
                 } catch (e) {
                     setStatus({ text: 'Invalid JSON in action editor', type: 'error' });
@@ -165,7 +220,16 @@ HTML_TEMPLATE = """
                             <div className="task-label">Select Task</div>
                             <div className="task-buttons">
                                 {['task1', 'task2', 'task3'].map(t => (
-                                    <button key={t} className={`task-btn ${task === t ? 'active' : ''}`} onClick={async () => { setTask(t); await fetchTaskScore(t); }}>
+                                    <button
+                                        key={t}
+                                        className={`task-btn ${task === t ? 'active' : ''}`}
+                                        onClick={async () => {
+                                            setTask(t);
+                                            const nextAction = suggestNextAction(t, response?.observation);
+                                            setAction(JSON.stringify(nextAction, null, 2));
+                                            await fetchTaskScore(t);
+                                        }}
+                                    >
                                         {t.replace('task', 'T')}
                                     </button>
                                 ))}
