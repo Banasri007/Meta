@@ -600,12 +600,12 @@ async def root():
 async def reset():
     """Reset environment"""
     initial_obs = env.reset()
+    obs_dict = initial_obs.dict() if hasattr(initial_obs, 'dict') else initial_obs
     return {
-        "observation": initial_obs.dict() if hasattr(initial_obs, 'dict') else initial_obs,
+        "observation": obs_dict,
         "reward": 0.0,
         "done": False,
-        "step": 0,
-        "status_message": initial_obs.status_message if hasattr(initial_obs, 'status_message') else "Environment reset"
+        "step": 0
     }
 
 
@@ -613,7 +613,13 @@ async def reset():
 async def reset_get():
     """Browser-friendly reset alias (GET)."""
     initial_obs = env.reset()
-    return initial_obs
+    obs_dict = initial_obs.dict() if hasattr(initial_obs, 'dict') else initial_obs
+    return {
+        "observation": obs_dict,
+        "reward": 0.0,
+        "done": False,
+        "step": 0
+    }
 
 @app.post("/step")
 async def step(action: Action):
@@ -621,14 +627,12 @@ async def step(action: Action):
     try:
         obs, reward, done, info = env.step(action)
         reward_val = float(reward.total if hasattr(reward, 'total') else reward)
+        obs_dict = obs.dict() if hasattr(obs, 'dict') else obs
         return {
-            "observation": obs.dict() if hasattr(obs, 'dict') else obs,
+            "observation": obs_dict,
             "reward": reward_val,
             "done": bool(done),
-            "info": info if isinstance(info, dict) else {},
-            "bill": obs.cost_data.projected_monthly_bill if hasattr(obs, 'cost_data') else 0.0,
-            "latency": obs.health_status.system_latency_ms if hasattr(obs, 'health_status') else 0.0,
-            "status_message": obs.status_message if hasattr(obs, 'status_message') else ""
+            "info": info if isinstance(info, dict) else {}
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -637,12 +641,12 @@ async def step(action: Action):
 async def state():
     """Get current state"""
     obs = env.get_observation("Current state requested.")
+    obs_dict = obs.dict() if hasattr(obs, 'dict') else obs
     return {
-        "observation": obs.dict() if hasattr(obs, 'dict') else obs,
-        "step": env.step_count,
-        "bill": obs.cost_data.projected_monthly_bill if hasattr(obs, 'cost_data') else 0.0,
-        "latency": obs.health_status.system_latency_ms if hasattr(obs, 'health_status') else 0.0,
-        "status_message": obs.status_message if hasattr(obs, 'status_message') else ""
+        "observation": obs_dict,
+        "reward": 0.0,
+        "done": False,
+        "info": {}
     }
 
 @app.get("/tasks")
