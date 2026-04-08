@@ -1,374 +1,305 @@
 """
-FinOps Cloud Optimizer - Streamlit Frontend for Hugging Face Spaces
-
-Deploy steps:
-1. Go to huggingface.co/spaces → New Space → choose Streamlit SDK
-2. Upload this app.py + requirements.txt
-3. Set Space secret: FINOPS_API_URL = https://mahekgupta312006-finops-optimizer.hf.space
+FinOps Cloud Optimizer - FastAPI server with embedded React UI
 """
 
-import os
-import json
-import streamlit as st
-import requests
-from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
-# ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="FinOps Optimizer",
-    page_icon="☁️",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from env.engine import FinOpsEngine
+from env.models import Action
+from env.tasks import get_task_score as compute_task_score, list_tasks
+
+# ────────────────────────────────────────────────────────────────────────────
+# HTML TEMPLATE WITH EMBEDDED REACT UI
+# ────────────────────────────────────────────────────────────────────────────
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FinOps Cloud Optimizer</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif; background-color: #f5f5f5; color: #333; }
+        .header { background: #fff; border-bottom: 1px solid #e0e0e0; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .header-left { display: flex; align-items: center; gap: 12px; }
+        .header-title { font-size: 24px; font-weight: 600; color: #333; }
+        .header-badge { background: #dbeafe; color: #1e40af; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
+        .header-right { display: flex; gap: 16px; align-items: center; }
+        .stage-badge { background: #dcfce7; color: #166534; padding: 4px 12px; border-radius: 16px; font-size: 12px; font-weight: 500; }
+        .container { display: flex; height: calc(100vh - 64px); }
+        .sidebar { width: 280px; background: #f9f9f9; border-right: 1px solid #e0e0e0; padding: 24px 16px; overflow-y: auto; }
+        .task-label { font-size: 12px; font-weight: 600; color: #999; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+        .task-buttons { display: flex; gap: 8px; margin-bottom: 24px; }
+        .task-btn { flex: 1; padding: 8px 12px; border: 1px solid #ddd; background: #fff; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s; }
+        .task-btn.active { background: #dcfce7; border-color: #4ade80; color: #166534; }
+        .task-btn:hover { border-color: #999; }
+        .task-desc { font-size: 13px; color: #666; line-height: 1.5; margin-bottom: 24px; }
+        .sidebar-divider { border: none; border-top: 1px solid #e0e0e0; margin: 16px 0; }
+        .code-snippet { font-size: 11px; color: #666; background: #f0f0f0; padding: 12px; border-radius: 4px; overflow: auto; max-height: 150px; font-family: 'Monaco', 'Courier New', monospace; line-height: 1.4; }
+        .main-content { flex: 1; display: flex; flex-direction: column; }
+        .tabs { background: #fff; border-bottom: 1px solid #e0e0e0; display: flex; padding: 0 24px; }
+        .tab { padding: 12px 16px; border: none; background: none; cursor: pointer; font-size: 14px; font-weight: 500; color: #999; border-bottom: 2px solid transparent; transition: all 0.2s; }
+        .tab.active { color: #333; border-bottom-color: #333; }
+        .content { flex: 1; overflow-y: auto; padding: 24px; }
+        .metrics-row { display: flex; gap: 16px; margin-bottom: 24px; }
+        .metric { flex: 1; background: #fff; padding: 16px; border-radius: 8px; border: 1px solid #e0e0e0; }
+        .metric-label { font-size: 12px; color: #999; font-weight: 500; margin-bottom: 8px; }
+        .metric-value { font-size: 24px; font-weight: 600; color: #333; }
+        .action-editor { background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .editor-label { font-size: 12px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; display: block; }
+        textarea { width: 100%; height: 150px; padding: 12px; border: 1px solid #e0e0e0; border-radius: 4px; font-family: 'Monaco', 'Courier New', monospace; font-size: 12px; resize: vertical; }
+        textarea:focus { outline: none; border-color: #4ade80; box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.1); }
+        textarea:disabled { background: #f5f5f5; color: #999; }
+        .button-group { display: flex; gap: 12px; margin-top: 16px; }
+        button { padding: 10px 20px; border: 1px solid #e0e0e0; border-radius: 4px; background: #fff; cursor: pointer; font-size: 14px; font-weight: 500; transition: all 0.2s; }
+        button.primary { background: #4ade80; color: #fff; border-color: #4ade80; }
+        button.primary:hover { background: #22c55e; }
+        button:hover { border-color: #999; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .status-box { background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .status-label { font-size: 12px; font-weight: 600; color: #666; margin-bottom: 8px; }
+        .status-message { color: #4ade80; font-size: 14px; }
+        .status-message.error { color: #ef4444; }
+        .checkbox-group { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+        .checkbox-group label { font-size: 14px; cursor: pointer; }
+        .json-viewer { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; overflow: auto; font-family: 'Monaco', 'Courier New', monospace; font-size: 12px; line-height: 1.5; max-height: 400px; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f5f5f5; }
+        ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #999; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState } = React;
+        function App() {
+            const [task, setTask] = useState('task1');
+            const [tab, setTab] = useState('manual');
+            const [action, setAction] = useState(JSON.stringify({action_type: 'delete_resource', resource_id: 'i-0abc123'}, null, 2));
+            const [status, setStatus] = useState({ text: '', type: 'info' });
+            const [response, setResponse] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [prettyPrint, setPrettyPrint] = useState(true);
+
+            const taskDescriptions = {
+                task1: "Task 1: Reduce EC2 Costs. Delete unused compute resources.",
+                task2: "Task 2: Optimize Storage. Modify storage tier to cheaper options.",
+                task3: "Task 3: Maximize Savings. Purchase reserved capacity plans."
+            };
+
+            const apiCall = async (method, endpoint, payload = null) => {
+                setLoading(true);
+                try {
+                    const options = { method, headers: { 'Content-Type': 'application/json' } };
+                    if (payload) options.body = JSON.stringify(payload);
+                    const resp = await fetch(endpoint, options);
+                    if (!resp.ok) throw new Error(`API error: ${resp.status}`);
+                    const data = await resp.json();
+                    setResponse(data);
+                    setStatus({ text: 'Success', type: 'success' });
+                    return data;
+                } catch (err) {
+                    setStatus({ text: `Error: ${err.message}`, type: 'error' });
+                    setResponse(null);
+                }
+                setLoading(false);
+            };
+
+            const handleReset = async () => { setLoading(true); await apiCall('POST', '/reset'); setLoading(false); };
+            const handleState = async () => { setLoading(true); await apiCall('GET', '/state'); setLoading(false); };
+            const handleStep = async () => {
+                try {
+                    const parsed = JSON.parse(action);
+                    setLoading(true);
+                    await apiCall('POST', '/step', parsed);
+                    setLoading(false);
+                } catch {
+                    setStatus({ text: 'Invalid JSON in action editor', type: 'error' });
+                }
+            };
+
+            return (
+                <>
+                    <div className="header">
+                        <div className="header-left">
+                            <div className="header-title">FinOps</div>
+                            <div className="header-badge">Cloud Optimizer</div>
+                        </div>
+                        <div className="header-right"><div className="stage-badge">Stage: {task}</div></div>
+                    </div>
+                    <div className="container">
+                        <div className="sidebar">
+                            <div className="task-label">Select Task</div>
+                            <div className="task-buttons">
+                                {['task1', 'task2', 'task3'].map(t => (
+                                    <button key={t} className={`task-btn ${task === t ? 'active' : ''}`} onClick={() => setTask(t)}>
+                                        {t.replace('task', 'T')}
+                                    </button>
+                                ))}
+                            </div>
+                            <div className="task-desc">{taskDescriptions[task]}</div>
+                            <hr className="sidebar-divider" />
+                            <div className="task-label">Example Action</div>
+                            <div className="code-snippet">{`{\\n  "action_type": "delete_resource",\\n  "resource_id": "i-0abc123"\\n}`}</div>
+                        </div>
+                        <div className="main-content">
+                            <div className="tabs">
+                                {['manual', 'agent', 'supplier'].map(t => (
+                                    <button key={t} className={`tab ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>
+                                        {t === 'manual' ? 'Manual Play' : t === 'agent' ? 'Agent Run' : 'Play as Supplier'}
+                                    </button>
+                                ))}
+                            </div>
+                            <div className="content">
+                                {tab === 'manual' && (
+                                    <>
+                                        <div className="metrics-row">
+                                            <div className="metric">
+                                                <div className="metric-label">Reward</div>
+                                                <div className="metric-value">{response?.reward ?? 0}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Done</div>
+                                                <div className="metric-value">{response?.done ? 'Yes' : 'No'}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Round</div>
+                                                <div className="metric-value">{response?.observation?.round ?? 0}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Price</div>
+                                                <div className="metric-value">${response?.observation?.market_price ?? 0}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Market</div>
+                                                <div className="metric-value">{response?.observation?.market_condition ?? 'N/A'}</div>
+                                            </div>
+                                        </div>
+                                        <div className="action-editor">
+                                            <label className="editor-label">Action (JSON)</label>
+                                            <textarea value={action} onChange={(e) => setAction(e.target.value)} disabled={loading} />
+                                            <div className="button-group">
+                                                <button className="primary" onClick={handleStep} disabled={loading}>▶ Step</button>
+                                                <button onClick={handleReset} disabled={loading}>↺ Reset</button>
+                                                <button onClick={handleState} disabled={loading}>ℹ State</button>
+                                            </div>
+                                        </div>
+                                        <div className="status-box">
+                                            <div className="status-label">Status</div>
+                                            <div className={`status-message ${status.type === 'error' ? 'error' : ''}`}>
+                                                {status.text || 'Ready'}
+                                            </div>
+                                        </div>
+                                        {response && (
+                                            <>
+                                                <div className="checkbox-group">
+                                                    <input type="checkbox" id="pretty" checked={prettyPrint} onChange={(e) => setPrettyPrint(e.target.checked)} />
+                                                    <label htmlFor="pretty">Pretty Print</label>
+                                                </div>
+                                                <div className="json-viewer">
+                                                    {prettyPrint ? JSON.stringify(response, null, 2) : JSON.stringify(response)}
+                                                </div>
+                                            </>
+                                        )}
+                                    </>
+                                )}
+                                {tab === 'agent' && <div style={{padding: '20px', textAlign: 'center', color: '#999'}}>Agent Run feature coming soon...</div>}
+                                {tab === 'supplier' && <div style={{padding: '20px', textAlign: 'center', color: '#999'}}>Play as Supplier feature coming soon...</div>}
+                            </div>
+                        </div>
+                    </div>
+                </>
+            );
+        }
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
+"""
+
+# ────────────────────────────────────────────────────────────────────────────
+# FASTAPI APP
+# ────────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="FinOps Cloud Optimizer")
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ── Custom CSS — dark terminal aesthetic like the reference UI ─────────────────
-st.markdown("""
-<style>
-/* ---------- global ---------- */
-html, body, [data-testid="stAppViewContainer"] {
-    background-color: #0d0d0d;
-    color: #e0e0e0;
-    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-}
-[data-testid="stSidebar"] {
-    background-color: #111111;
-    border-right: 1px solid #222;
-}
-/* ---------- headings ---------- */
-h1, h2, h3 {
-    font-family: 'JetBrains Mono', monospace !important;
-    letter-spacing: -0.02em;
-}
-/* ---------- metric cards ---------- */
-[data-testid="stMetric"] {
-    background: #161616;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    padding: 12px 16px !important;
-}
-[data-testid="stMetricValue"] { color: #4ade80; font-size: 1.4rem !important; }
-[data-testid="stMetricLabel"] { color: #888; font-size: 0.72rem !important; }
-/* ---------- buttons ---------- */
-.stButton > button {
-    background: #1a1a1a !important;
-    color: #e0e0e0 !important;
-    border: 1px solid #333 !important;
-    border-radius: 5px !important;
-    font-family: monospace !important;
-    font-size: 13px !important;
-    transition: all 0.15s;
-}
-.stButton > button:hover {
-    border-color: #4ade80 !important;
-    color: #4ade80 !important;
-}
-/* Primary button (Step) */
-div[data-testid="column"]:first-child .stButton > button {
-    background: #166534 !important;
-    border-color: #4ade80 !important;
-    color: #4ade80 !important;
-}
-div[data-testid="column"]:first-child .stButton > button:hover {
-    background: #15803d !important;
-}
-/* ---------- code blocks ---------- */
-[data-testid="stCodeBlock"] pre {
-    background: #0a0a0a !important;
-    border: 1px solid #222 !important;
-    border-radius: 6px !important;
-    font-size: 12px !important;
-}
-/* ---------- json viewer ---------- */
-[data-testid="stJson"] {
-    background: #0a0a0a !important;
-    border: 1px solid #222 !important;
-    border-radius: 6px !important;
-}
-/* ---------- selectbox / text_input ---------- */
-[data-testid="stSelectbox"] select,
-[data-testid="stTextInput"] input {
-    background: #111 !important;
-    color: #e0e0e0 !important;
-    border-color: #333 !important;
-    font-family: monospace !important;
-    font-size: 13px !important;
-}
-/* ---------- status box ---------- */
-.status-box {
-    background: #0d1a0d;
-    border: 1px solid #166534;
-    border-radius: 6px;
-    padding: 10px 16px;
-    color: #4ade80;
-    font-family: monospace;
-    font-size: 14px;
-    margin-bottom: 12px;
-}
-.status-box.error {
-    background: #1a0d0d;
-    border-color: #7f1d1d;
-    color: #f87171;
-}
-.status-box.info {
-    background: #0d0d1a;
-    border-color: #1d3a7f;
-    color: #93c5fd;
-}
-/* ---------- divider ---------- */
-hr { border-color: #222 !important; }
-/* ---------- tabs ---------- */
-[data-testid="stTab"] {
-    font-family: monospace !important;
-    font-size: 13px !important;
-}
-</style>
-""", unsafe_allow_html=True)
+# Initialize engine
+env = FinOpsEngine()
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-API_URL = os.getenv(
-    "FINOPS_API_URL",
-    "https://mahekgupta312006-finops-optimizer.hf.space"
-)
+# ────────────────────────────────────────────────────────────────────────────
+# API ROUTES
+# ────────────────────────────────────────────────────────────────────────────
 
-# ── Session state ──────────────────────────────────────────────────────────────
-for key, default in [
-    ("observation", None),
-    ("logs", []),
-    ("status_msg", ""),
-    ("status_type", "info"),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    """Serve React frontend"""
+    return HTML_TEMPLATE
 
-# ── API helpers ────────────────────────────────────────────────────────────────
-def log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    st.session_state.logs.insert(0, f"[{ts}] {msg}")
+@app.post("/reset")
+async def reset():
+    """Reset environment"""
+    initial_obs = env.reset()
+    return initial_obs
 
-def set_status(msg: str, kind: str = "info"):
-    st.session_state.status_msg = msg
-    st.session_state.status_type = kind
-
-def api_reset():
+@app.post("/step")
+async def step(action: Action):
+    """Execute action"""
     try:
-        log("→ POST /reset")
-        r = requests.post(f"{API_URL}/reset", timeout=30)
-        r.raise_for_status()
-        st.session_state.observation = r.json()
-        set_status("✅  Reset successful — environment reloaded.", "ok")
-        log("✅ Reset OK")
+        obs, reward, done, info = env.step(action)
+        return {
+            "observation": obs,
+            "reward": reward.total if hasattr(reward, 'total') else reward,
+            "reward_detail": reward,
+            "done": done,
+            "info": info
+        }
     except Exception as e:
-        set_status(f"❌  Reset failed: {e}", "error")
-        log(f"❌ Reset failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
-def api_state():
+@app.get("/state")
+async def state():
+    """Get current state"""
+    return env.get_observation("Current state requested.")
+
+@app.get("/tasks")
+async def tasks():
+    """List tasks"""
+    return {"tasks": list_tasks()}
+
+@app.get("/tasks/{task_id}/score")
+async def get_task_score(task_id: str):
+    """Get task score"""
     try:
-        log("→ GET /state")
-        r = requests.get(f"{API_URL}/state", timeout=30)
-        r.raise_for_status()
-        st.session_state.observation = r.json()
-        set_status("✅  State fetched.", "ok")
-        log("✅ State fetched")
-    except Exception as e:
-        set_status(f"❌  State fetch failed: {e}", "error")
-        log(f"❌ State failed: {e}")
+        score = compute_task_score(env, task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"task_id": task_id, "score": score}
 
-def api_step(action_type: str, **kwargs):
-    try:
-        payload = {"action_type": action_type, **kwargs}
-        log(f"→ POST /step  action={action_type}")
-        r = requests.post(f"{API_URL}/step", json=payload, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        st.session_state.observation = data.get("observation", data)
-        reward = data.get("reward", "—")
-        done   = data.get("done", False)
-        reward_str = f"{reward:+.3f}" if isinstance(reward, float) else str(reward)
-        status = f"✅  Step executed — reward={reward_str}"
-        if done:
-            status += "  |  🏁 Episode done"
-        set_status(status, "ok")
-        log(f"✅ Step OK  reward={reward_str}  done={done}")
-    except Exception as e:
-        set_status(f"❌  Step failed: {e}", "error")
-        log(f"❌ Step failed: {e}")
+# ────────────────────────────────────────────────────────────────────────────
+# HEALTH CHECK
+# ────────────────────────────────────────────────────────────────────────────
 
-def api_score(task_id: str) -> float:
-    try:
-        r = requests.get(f"{API_URL}/tasks/{task_id}/score", timeout=15)
-        r.raise_for_status()
-        return r.json().get("score", 0.0)
-    except Exception:
-        return 0.0
+@app.get("/health")
+async def health():
+    """Health check"""
+    return {"status": "ok", "message": "FinOps Cloud Optimizer is running"}
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## QUICK CONNECT")
-
-    # Copy-paste snippet
-    snippet = f"""from server.environment import FinOpsEnvironment
-from models import OptimizationAction
-
-env = FinOpsEnvironment(task_id=1)
-obs = env.reset()
-obs = env.step(OptimizationAction(
-    action_type="delete_resource",
-    resource_id="i-0abc123"
-))"""
-    st.code(snippet, language="python")
-
-    st.markdown("---")
-    st.markdown("## RUN INFERENCE")
-    st.code("python inference.py", language="bash")
-    st.code("TASK_ID=1 python inference.py", language="bash")
-
-    st.markdown("---")
-    st.markdown("## ACTIONS")
-
-    action_type = st.selectbox(
-        "Action type",
-        ["delete_resource", "modify_instance", "purchase_savings_plan"],
-        label_visibility="collapsed",
-    )
-
-    if action_type == "delete_resource":
-        resource_id = st.text_input("Resource ID", placeholder="i-0abc123def456")
-        if st.button("▶  Execute delete_resource", use_container_width=True):
-            if resource_id:
-                api_step("delete_resource", resource_id=resource_id)
-                st.rerun()
-            else:
-                st.warning("Enter a resource ID first.")
-
-    elif action_type == "modify_instance":
-        instance_id = st.text_input("Instance ID", placeholder="i-0abc123def456")
-        new_type    = st.text_input("New type", value="t3.small")
-        if st.button("▶  Execute modify_instance", use_container_width=True):
-            if instance_id:
-                api_step("modify_instance", instance_id=instance_id, new_type=new_type)
-                st.rerun()
-            else:
-                st.warning("Enter an instance ID first.")
-
-    elif action_type == "purchase_savings_plan":
-        plan_type = st.selectbox("Plan type", ["compute", "database"])
-        duration  = st.selectbox("Duration",  ["1y", "3y"])
-        if st.button("▶  Execute purchase_savings_plan", use_container_width=True):
-            api_step("purchase_savings_plan", plan_type=plan_type, duration=duration)
-            st.rerun()
-
-    st.markdown("---")
-    st.markdown("## SERVER")
-    st.markdown(f"Base: `{API_URL}`")
-    st.markdown(f"API docs: [{API_URL}/docs]({API_URL}/docs)")
-
-# ── Main area ──────────────────────────────────────────────────────────────────
-st.markdown("# ☁️  FinOps Cloud Optimizer")
-
-# ── Top action bar (Step / Reset / State) ─────────────────────────────────────
-col_step, col_reset, col_state, col_spacer = st.columns([1, 1, 1, 5])
-
-with col_step:
-    if st.button("▶  Step", use_container_width=True):
-        # Generic step with no-op action to advance environment
-        api_step("noop")
-        st.rerun()
-
-with col_reset:
-    if st.button("↺  Reset", use_container_width=True):
-        api_reset()
-        st.rerun()
-
-with col_state:
-    if st.button("ℹ  State", use_container_width=True):
-        api_state()
-        st.rerun()
-
-# ── Status bar ─────────────────────────────────────────────────────────────────
-if st.session_state.status_msg:
-    css_class = {
-        "ok":    "status-box",
-        "error": "status-box error",
-        "info":  "status-box info",
-    }.get(st.session_state.status_type, "status-box info")
-    st.markdown(
-        f'<div class="{css_class}">{st.session_state.status_msg}</div>',
-        unsafe_allow_html=True,
-    )
-
-st.markdown("---")
-
-# ── Observation panels ─────────────────────────────────────────────────────────
-if st.session_state.observation:
-    obs       = st.session_state.observation
-    cost_data = obs.get("cost_data", {})
-    inventory = obs.get("inventory", [])
-
-    # Metrics row
-    st.markdown("### Status")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Episode",      obs.get("episode_id", "—")[:10] if obs.get("episode_id") else "—")
-    m2.metric("Step count",   obs.get("step_count", 0))
-    m3.metric("Monthly bill", f"${cost_data.get('projected_monthly_bill', 0):,.2f}")
-    m4.metric("P99 latency",  f"{cost_data.get('p99_latency_ms', 0):.0f} ms")
-    m5.metric("Throttle events", cost_data.get("throttle_events", 0))
-
-    st.markdown("---")
-
-    # Task scores row
-    st.markdown("### Task scores")
-    t1, t2, t3 = st.columns(3)
-    t1.metric("Cleanup unattached",  f"{api_score('cleanup_unattached'):.1%}")
-    t2.metric("Rightsize compute",   f"{api_score('rightsize_compute'):.1%}")
-    t3.metric("Fleet strategy",      f"{api_score('fleet_strategy'):.1%}")
-
-    st.markdown("---")
-
-    # Inventory table
-    st.markdown("### Inventory")
-    if inventory:
-        rows = [
-            {
-                "ID":       r.get("id", "")[:14],
-                "Type":     r.get("resource_type", "—"),
-                "Category": r.get("category", "—"),
-                "CPU %":    round(r.get("cpu_usage_pct_30d", 0), 1),
-                "Cost/hr":  f"${r.get('hourly_cost', 0):.3f}",
-                "Region":   r.get("region", "—"),
-                "State":    r.get("state", "—"),
-            }
-            for r in inventory
-        ]
-        st.dataframe(rows, use_container_width=True, height=280)
-    else:
-        st.info("No inventory data. Click **Reset** to load resources.")
-
-    st.markdown("---")
-
-    # Raw JSON
-    st.markdown("### Raw JSON response")
-    pretty = st.checkbox("Pretty-print", value=True)
-    if pretty:
-        st.json(obs)
-    else:
-        st.code(json.dumps(obs), language="json")
-
-else:
-    # Nothing loaded yet — show hint matching reference UI
-    st.markdown(
-        '<div class="status-box info">👈  Click <strong>Reset</strong> to load the environment, '
-        'or <strong>State</strong> to fetch current state.</div>',
-        unsafe_allow_html=True,
-    )
-
-    # Show placeholder pretty-print checkbox (matches reference)
-    pretty = st.checkbox("Pretty-print", value=True)
-
-st.markdown("---")
-
-# ── Logs ───────────────────────────────────────────────────────────────────────
-st.markdown("### Logs")
-if st.session_state.logs:
-    st.code("\n".join(st.session_state.logs[:40]), language="")
-else:
-    st.info("No logs yet — actions will appear here.")
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
