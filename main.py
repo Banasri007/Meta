@@ -28,17 +28,23 @@ async def root():
 async def reset():
     """
     Standard OpenEnv API: Resets the environment to the initial state.
-    Returns: The initial Observation.
+    Returns: The initial Observation with cloud optimization state.
     """
     initial_obs = env.reset()
-    return initial_obs
+    return {
+        "observation": initial_obs.dict() if hasattr(initial_obs, 'dict') else initial_obs,
+        "reward": 0.0,
+        "done": False,
+        "step": 0,
+        "status_message": initial_obs.status_message if hasattr(initial_obs, 'status_message') else "Environment reset"
+    }
 
 @app.post("/step")
 async def step(action: Action):
     """
     Standard OpenEnv API: Takes an action and returns the result.
     Args: action (Action model defined in models.py)
-    Returns: {observation, reward, done, info}
+    Returns: {observation, reward, done, info} with cloud metrics
     """
     try:
         obs, reward, done, info = env.step(action)
@@ -47,7 +53,10 @@ async def step(action: Action):
             "observation": obs.dict() if hasattr(obs, 'dict') else obs,
             "reward": reward_val,
             "done": bool(done),
-            "info": info if isinstance(info, dict) else {}
+            "info": info if isinstance(info, dict) else {},
+            "bill": obs.cost_data.projected_monthly_bill if hasattr(obs, 'cost_data') else 0.0,
+            "latency": obs.health_status.system_latency_ms if hasattr(obs, 'health_status') else 0.0,
+            "status_message": obs.status_message if hasattr(obs, 'status_message') else ""
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -57,7 +66,14 @@ async def state():
     """
     Standard OpenEnv API: Returns the current state without taking a step.
     """
-    return env.get_observation("Current state requested.")
+    obs = env.get_observation("Current state requested.")
+    return {
+        "observation": obs.dict() if hasattr(obs, 'dict') else obs,
+        "step": env.step_count,
+        "bill": obs.cost_data.projected_monthly_bill if hasattr(obs, 'cost_data') else 0.0,
+        "latency": obs.health_status.system_latency_ms if hasattr(obs, 'health_status') else 0.0,
+        "status_message": obs.status_message if hasattr(obs, 'status_message') else ""
+    }
 
 # --- Task Graders (For the OpenEnv Validator) ---
 

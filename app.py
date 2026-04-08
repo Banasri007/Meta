@@ -162,24 +162,24 @@ HTML_TEMPLATE = """
                                     <>
                                         <div className="metrics-row">
                                             <div className="metric">
+                                                <div className="metric-label">Bill Amount</div>
+                                                <div className="metric-value">${response?.observation?.cost_data?.projected_monthly_bill ? response.observation.cost_data.projected_monthly_bill.toFixed(2) : '0.00'}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Latency (ms)</div>
+                                                <div className="metric-value">{response?.observation?.health_status?.system_latency_ms ? response.observation.health_status.system_latency_ms.toFixed(1) : '0'}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Throttling</div>
+                                                <div className="metric-value">{response?.observation?.health_status?.throttling_events ?? 0}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Downtime</div>
+                                                <div className="metric-value">{response?.observation?.health_status?.downtime_events ?? 0}</div>
+                                            </div>
+                                            <div className="metric">
                                                 <div className="metric-label">Reward</div>
-                                                <div className="metric-value">{response?.reward ?? 0}</div>
-                                            </div>
-                                            <div className="metric">
-                                                <div className="metric-label">Done</div>
-                                                <div className="metric-value">{response?.done ? 'Yes' : 'No'}</div>
-                                            </div>
-                                            <div className="metric">
-                                                <div className="metric-label">Round</div>
-                                                <div className="metric-value">{response?.observation?.round ?? 0}</div>
-                                            </div>
-                                            <div className="metric">
-                                                <div className="metric-label">Price</div>
-                                                <div className="metric-value">${response?.observation?.market_price ?? 0}</div>
-                                            </div>
-                                            <div className="metric">
-                                                <div className="metric-label">Market</div>
-                                                <div className="metric-value">{response?.observation?.market_condition ?? 'N/A'}</div>
+                                                <div className="metric-value">{response?.reward ? response.reward.toFixed(3) : '0.000'}</div>
                                             </div>
                                         </div>
                                         <div className="action-editor">
@@ -286,7 +286,13 @@ async def root():
 async def reset():
     """Reset environment"""
     initial_obs = env.reset()
-    return initial_obs
+    return {
+        "observation": initial_obs.dict() if hasattr(initial_obs, 'dict') else initial_obs,
+        "reward": 0.0,
+        "done": False,
+        "step": 0,
+        "status_message": initial_obs.status_message if hasattr(initial_obs, 'status_message') else "Environment reset"
+    }
 
 @app.post("/step")
 async def step(action: Action):
@@ -298,7 +304,10 @@ async def step(action: Action):
             "observation": obs.dict() if hasattr(obs, 'dict') else obs,
             "reward": reward_val,
             "done": bool(done),
-            "info": info if isinstance(info, dict) else {}
+            "info": info if isinstance(info, dict) else {},
+            "bill": obs.cost_data.projected_monthly_bill if hasattr(obs, 'cost_data') else 0.0,
+            "latency": obs.health_status.system_latency_ms if hasattr(obs, 'health_status') else 0.0,
+            "status_message": obs.status_message if hasattr(obs, 'status_message') else ""
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -307,7 +316,13 @@ async def step(action: Action):
 async def state():
     """Get current state"""
     obs = env.get_observation("Current state requested.")
-    return obs.dict() if hasattr(obs, 'dict') else obs
+    return {
+        "observation": obs.dict() if hasattr(obs, 'dict') else obs,
+        "step": env.step_count,
+        "bill": obs.cost_data.projected_monthly_bill if hasattr(obs, 'cost_data') else 0.0,
+        "latency": obs.health_status.system_latency_ms if hasattr(obs, 'health_status') else 0.0,
+        "status_message": obs.status_message if hasattr(obs, 'status_message') else ""
+    }
 
 @app.get("/tasks")
 async def tasks():
