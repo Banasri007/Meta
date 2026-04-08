@@ -87,11 +87,30 @@ HTML_TEMPLATE = """
             const [response, setResponse] = useState(null);
             const [loading, setLoading] = useState(false);
             const [prettyPrint, setPrettyPrint] = useState(true);
+            const [taskScore, setTaskScore] = useState(0);
 
             const taskDescriptions = {
                 task1: "Task 1: Reduce EC2 Costs. Delete unused compute resources.",
                 task2: "Task 2: Optimize Storage. Modify storage tier to cheaper options.",
                 task3: "Task 3: Maximize Savings. Purchase reserved capacity plans."
+            };
+            const taskIdMap = {
+                task1: "cleanup_unattached",
+                task2: "rightsize_compute",
+                task3: "fleet_strategy"
+            };
+
+            const fetchTaskScore = async (currentTask = task) => {
+                try {
+                    const taskId = taskIdMap[currentTask];
+                    const resp = await fetch(`/tasks/${taskId}/score`);
+                    const data = await resp.json();
+                    if (resp.ok && typeof data?.score === "number") {
+                        setTaskScore(data.score);
+                    }
+                } catch (err) {
+                    console.error("Score fetch failed", err);
+                }
             };
 
             const apiCall = async (method, endpoint, payload = null) => {
@@ -114,12 +133,19 @@ HTML_TEMPLATE = """
                 }
             };
 
-            const handleReset = async () => await apiCall('POST', '/reset');
-            const handleState = async () => await apiCall('GET', '/state');
+            const handleReset = async () => {
+                await apiCall('POST', '/reset');
+                await fetchTaskScore();
+            };
+            const handleState = async () => {
+                await apiCall('GET', '/state');
+                await fetchTaskScore();
+            };
             const handleStep = async () => {
                 try {
                     const parsed = JSON.parse(action);
                     await apiCall('POST', '/step', parsed);
+                    await fetchTaskScore();
                 } catch (e) {
                     setStatus({ text: 'Invalid JSON in action editor', type: 'error' });
                 }
@@ -139,7 +165,7 @@ HTML_TEMPLATE = """
                             <div className="task-label">Select Task</div>
                             <div className="task-buttons">
                                 {['task1', 'task2', 'task3'].map(t => (
-                                    <button key={t} className={`task-btn ${task === t ? 'active' : ''}`} onClick={() => setTask(t)}>
+                                    <button key={t} className={`task-btn ${task === t ? 'active' : ''}`} onClick={async () => { setTask(t); await fetchTaskScore(t); }}>
                                         {t.replace('task', 'T')}
                                     </button>
                                 ))}
@@ -180,6 +206,10 @@ HTML_TEMPLATE = """
                                             <div className="metric">
                                                 <div className="metric-label">Reward</div>
                                                 <div className="metric-value">{response?.reward ? response.reward.toFixed(3) : '0.000'}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Task Score</div>
+                                                <div className="metric-value">{taskScore.toFixed(2)} ({(taskScore * 100).toFixed(0)}%)</div>
                                             </div>
                                         </div>
                                         <div className="action-editor">
