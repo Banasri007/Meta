@@ -33,6 +33,15 @@ async def reset():
     initial_obs = env.reset()
     return initial_obs
 
+
+@app.get("/reset")
+async def reset_get():
+    """
+    Convenience alias so browser GET requests can also reset the environment.
+    OpenEnv evaluators should still use POST /reset.
+    """
+    return env.reset()
+
 @app.post("/step")
 async def step(action: Action):
     """
