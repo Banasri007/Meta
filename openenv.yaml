@@ -8,7 +8,7 @@ tags:
   - "optimization"
   - "rl-environment"
 runtime: "python"
-entrypoint: "main:app"
+entrypoint: "app:app"
 port: 7860
 
 # Define the 3 required tasks
