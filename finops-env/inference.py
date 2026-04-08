@@ -27,7 +27,7 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "220"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "45"))
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "20"))
 EXPLORE_RATE = float(os.getenv("EXPLORE_RATE", "0.1"))
-POLICY_SEED_TEXT = os.getenv("POLICY_SEED") or os.getenv("FINOPS_SEED")
+POLICY_SEED_TEXT = os.getenv("POLICY_SEED") or os.getenv("FINOPS_SEED", "42")
 POLICY_SEED = int(POLICY_SEED_TEXT) if POLICY_SEED_TEXT and POLICY_SEED_TEXT.strip() else None
 POLICY_RNG = random.Random(POLICY_SEED) if POLICY_SEED is not None else random.Random()
 

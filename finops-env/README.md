@@ -1,8 +1,40 @@
+---
+title: FinOps Optimizer
+emoji: "💸"
+colorFrom: blue
+colorTo: green
+sdk: docker
+tags:
+  - openenv
+  - finops
+  - reinforcement-learning
+---
+
 # FinOps Agent Environment (OpenEnv)
 
-## Description And Motivation
+## Environment Description
 
-Cloud cost optimization (FinOps) is a real operational workflow in companies running production infrastructure. This environment simulates decisions a FinOps engineer makes daily: deleting idle resources, rightsizing underutilized compute, and purchasing savings plans while protecting latency and uptime.
+This environment simulates a real cloud operations workflow: monthly FinOps optimization for a mixed production and non-production fleet. The agent acts like a platform/FinOps engineer by removing waste, rightsizing resources, and purchasing savings plans without breaking reliability targets.
+
+This is explicitly **not** a toy game. It models decisions humans perform in cloud cost governance.
+
+## OpenEnv Spec Compliance
+
+- Typed models in `env/models.py`:
+  - `Observation` (inventory, cost, health, status message)
+  - `Action` (discriminated union of 4 action types)
+  - `Reward` (`total`, `action_reward`, `bill_change_reward`)
+- Core interface in `env/engine.py`:
+  - `reset() -> Observation`
+  - `step(action) -> (Observation, Reward, done, info)`
+  - `state() -> Observation`
+- Metadata in `openenv.yaml`
+- HTTP API in `main.py`:
+  - `POST /reset`
+  - `POST /step`
+  - `GET /state`
+  - `GET /tasks`
+  - `GET /tasks/{task_id}/score`
 
 ## Action Space
 
@@ -11,96 +43,114 @@ Cloud cost optimization (FinOps) is a real operational workflow in companies run
 - `purchase_savings_plan(plan_type, duration)`
 - `tag_resource(resource_id, tag_key, tag_value)`
 
-These are implemented as typed Pydantic models in `env/models.py`.
-
 ## Observation Space
 
-- `inventory`: compute, database, and storage resources
-- 30-day metrics: `cpu_usage_pct_30d`, `memory_usage_pct_30d`, `network_io_mbps_30d`
-- cost view: `daily_burn_rate`, `projected_monthly_bill`
-- health view: `system_latency_ms`, throttling count, downtime count
+- `inventory`: list of compute/storage/database resources
+- Utilization signals: `cpu_usage_pct_30d`, `memory_usage_pct_30d`, `network_io_mbps_30d`
+- Financial view: `daily_burn_rate`, `projected_monthly_bill`
+- Reliability view: `system_latency_ms`, `throttling_events`, `downtime_events`
+- Status string: `status_message`
 
-## Reward Model
+## Reward Function (Dense + Partial Progress)
 
-Reward is continuous and shaped over the full trajectory.
+The reward is trajectory-shaped and meaningful at each step:
 
-- Positive reward for deleting idle resources and cost reduction
-- Penalty for risky downsizing that causes throttling
-- Critical penalty for attempted production DB deletion
-- Progress signal from projected monthly bill delta each step
+- Positive signal for beneficial actions (safe deletions, right-sizing, useful tagging)
+- Continuous progress reward from monthly bill reduction (`bill_delta / 200`)
+- Penalty for risky/destructive behavior:
+  - throttling-inducing downsize penalties
+  - production compute deletion penalty
+  - blocked production DB deletion with severe negative reward
 
-Reward is represented by a typed Pydantic `Reward` model (`total`, `action_reward`, `bill_change_reward`).
+This gives incremental learning signal instead of only end-of-episode binary reward.
 
-## Tasks And Difficulty
+## Tasks With Programmatic Graders
 
-- `cleanup_unattached` (easy): delete unattached volumes and idle test instances
-- `rightsize_compute` (medium): rightsize low-utilization compute while preserving latency
-- `fleet_strategy` (hard): combine decommissioning, rightsizing, and savings plans for ROI
+All graders are deterministic functions in `env/tasks.py` and return scores in `[0.0, 1.0]`:
 
-Programmatic graders are implemented in `env/tasks.py` and each task score is normalized to `[0.0, 1.0]`.
+1. `cleanup_unattached` (easy)
+   - Objective: delete unattached volumes and idle test instances
+2. `rightsize_compute` (medium)
+   - Objective: rightsize underutilized compute while keeping latency acceptable
+3. `fleet_strategy` (hard)
+   - Objective: achieve strong cost reduction + ROI with no downtime events
 
-## API Surface (OpenEnv)
-
-- `POST /reset`
-- `POST /step`
-- `GET /state`
-- `GET /tasks`
-- `GET /tasks/{task_id}/score`
-
-## Setup And Usage
-
-Install dependencies:
+## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Run locally:
+## Run Locally
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 7860
 ```
 
-Run baseline policy:
+## Validate OpenEnv Submission
+
+```bash
+openenv validate
+```
+
+## Baseline Inference (Reproducible)
+
+`baseline_inference.py` runs deterministic policies for each task on separate resets and prints all three scores.
 
 ```bash
 python baseline_inference.py
 ```
 
-Run OpenAI-driven inference policy:
+Determinism is controlled by `FINOPS_SEED` (default `42` in this repo).
+
+## Multi-Seed Baseline (Recommended Reporting)
+
+To avoid overfitting concerns from a single fixed seed, run multi-seed evaluation:
+
+```bash
+python multi_seed_baseline.py
+```
+
+Custom seeds:
+
+```bash
+FINOPS_SEEDS=42,43,44,45,46,47 python multi_seed_baseline.py
+```
+
+The script reports per-task scores by seed and aggregate `mean/stdev/min/max`.
+
+## LLM Inference Script (OpenAI Client)
+
+`inference.py` uses the official OpenAI client and reads credentials from environment variables.
+
+Required:
+- `OPENAI_API_KEY` (or `HF_TOKEN`)
+
+Optional:
+- `API_BASE_URL` (default: Hugging Face router)
+- `MODEL_NAME`
+- `ENV_BASE_URL`
+- `FINOPS_TASK`
+- `POLICY_SEED`
+
+Run:
 
 ```bash
 python inference.py
 ```
 
-Required environment variables for `inference.py`:
+## Docker / Hugging Face Spaces
 
-- `API_BASE_URL`
-- `MODEL_NAME`
-- `HF_TOKEN` (or `OPENAI_API_KEY`)
-- `ENV_BASE_URL`
+Build:
 
-## Baseline Scores (Latest Run)
+```bash
+docker build -t finops-openenv .
+```
 
-Example output from `baseline_inference.py`:
+Run:
 
-- `cleanup_unattached`: `1.00`
-- `rightsize_compute`: `1.00`
-- `fleet_strategy`: `1.00`
+```bash
+docker run --rm -p 7860:7860 finops-openenv
+```
 
-Note: scores vary slightly because the environment includes randomized initial utilization values.
-
-## Containerization
-
-- `Dockerfile` included for HF Space deployment
-- `.dockerignore` included for smaller and cleaner builds
-
-## Project Structure
-
-- `main.py`: FastAPI entrypoint
-- `openenv.yaml`: environment metadata and tasks
-- `env/models.py`: typed Action/Observation/Reward models
-- `env/engine.py`: transition and reward logic (`step`, `reset`, `get_observation`)
-- `env/tasks.py`: task definitions and graders
-- `baseline_inference.py`: deterministic baseline across all tasks
-- `inference.py`: OpenAI-client policy runner with structured logs
+The provided `Dockerfile` is compatible with Docker-based HF Spaces deployment.

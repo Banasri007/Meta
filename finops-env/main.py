@@ -57,7 +57,7 @@ async def state():
     """
     Standard OpenEnv API: Returns the current state without taking a step.
     """
-    return env.get_observation("Current state requested.")
+    return env.state()
 
 # --- Task Graders (For the OpenEnv Validator) ---
 

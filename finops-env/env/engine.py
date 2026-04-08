@@ -36,8 +36,8 @@ class FinOpsEngine:
     }
 
     def __init__(self) -> None:
-        seed_text = os.getenv("FINOPS_SEED")
-        self.seed: Optional[int] = int(seed_text) if seed_text and seed_text.strip() else None
+        seed_text = os.getenv("FINOPS_SEED", "42")
+        self.seed: Optional[int] = int(seed_text) if seed_text and seed_text.strip() else 42
         self.rng = random.Random(self.seed) if self.seed is not None else random.Random()
         self.resources: List[CloudResource] = []
         self.system_latency_ms: float = 80.0
@@ -200,6 +200,10 @@ class FinOpsEngine:
         )
         return self.get_observation("Environment reset. Optimization opportunities loaded.")
 
+    def state(self) -> Observation:
+        """Return the current observable environment state without mutation."""
+        return self.get_observation("Current state requested.")
+
     def step(self, action: Action) -> Tuple[Observation, Reward, bool, dict]:
         self.step_count += 1
         previous_bill = self.get_effective_bill()
@@ -270,6 +274,7 @@ class FinOpsEngine:
         if current_profile is None:
             return -0.1, f"Current type {target.resource_type} is not resizable in this simulator."
 
+        old_type = target.resource_type
         old_cost = target.monthly_cost
         old_capacity = current_profile["capacity"]
         new_capacity = new_profile["capacity"]
@@ -289,7 +294,7 @@ class FinOpsEngine:
 
         self._apply_resize_noise(target)
 
-        return reward, f"Modified {target.id} from {current_profile} to {action.new_type}."
+        return reward, f"Modified {target.id} from {old_type} to {action.new_type}."
 
     def _apply_resize_noise(self, modified_target: CloudResource) -> None:
         # Small stochastic drift after infra changes to mimic real workload variance.

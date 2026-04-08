@@ -44,21 +44,45 @@ def get(path: str) -> Dict:
     return parse_json_response(_session.get(f"{BASE_URL}{path}", timeout=30))
 
 
-def run_baseline() -> None:
-    print("Starting FinOps baseline rollout...")
+def _run_cleanup_policy() -> Dict:
     state = post("/reset", {})
-    print(f"Initial projected monthly bill: ${state['cost_data']['projected_monthly_bill']}")
-
     inventory: List[Dict] = state["inventory"]
-
-    # Easy: remove unattached storage + idle test instances.
     for resource in inventory:
         is_unattached_volume = resource["category"] == "storage" and not resource["is_attached"]
         is_idle_test = resource["category"] == "compute" and resource.get("tags", {}).get("lifecycle") == "idle"
         if is_unattached_volume or is_idle_test:
             post("/step", {"action_type": "delete_resource", "resource_id": resource["id"]})
+    return get("/state")
 
-    # Medium: right-size all low-utilization compute nodes.
+
+def _run_rightsize_policy() -> Dict:
+    post("/reset", {})
+    state = get("/state")
+    for resource in state["inventory"]:
+        if resource["category"] == "compute" and resource.get("cpu_usage_pct_30d", 0) < 5.0:
+            post(
+                "/step",
+                {
+                    "action_type": "modify_instance",
+                    "instance_id": resource["id"],
+                    "new_type": "t3.small",
+                },
+            )
+    return get("/state")
+
+
+def _run_fleet_policy() -> Dict:
+    post("/reset", {})
+    state = get("/state")
+    for resource in state["inventory"]:
+        is_safe_delete = (
+            (resource["category"] == "storage" and not resource["is_attached"])
+            or (resource["category"] == "compute" and resource.get("tags", {}).get("lifecycle") == "idle")
+            or (resource.get("is_legacy") and not resource.get("is_production"))
+        )
+        if is_safe_delete:
+            post("/step", {"action_type": "delete_resource", "resource_id": resource["id"]})
+
     state = get("/state")
     for resource in state["inventory"]:
         if resource["category"] == "compute" and resource.get("cpu_usage_pct_30d", 0) < 5.0:
@@ -71,26 +95,32 @@ def run_baseline() -> None:
                 },
             )
 
-    # Hard: remove legacy non-prod and buy baseline coverage plans.
-    state = get("/state")
-    for resource in state["inventory"]:
-        if resource.get("is_legacy") and not resource.get("is_production"):
-            post("/step", {"action_type": "delete_resource", "resource_id": resource["id"]})
-
     post("/step", {"action_type": "purchase_savings_plan", "plan_type": "compute", "duration": "1y"})
     post("/step", {"action_type": "purchase_savings_plan", "plan_type": "database", "duration": "1y"})
+    return get("/state")
 
-    score_cleanup = get("/tasks/cleanup_unattached/score")["score"]
-    score_rightsize = get("/tasks/rightsize_compute/score")["score"]
-    score_fleet = get("/tasks/fleet_strategy/score")["score"]
-    final_state = get("/state")
+
+def run_baseline() -> None:
+    print("Starting deterministic FinOps baseline rollout...")
+    print("Assumes environment uses FINOPS_SEED (default 42 in this repo).")
+
+    cleanup_state = _run_cleanup_policy()
+    cleanup_score = get("/tasks/cleanup_unattached/score")["score"]
+
+    rightsize_state = _run_rightsize_policy()
+    rightsize_score = get("/tasks/rightsize_compute/score")["score"]
+
+    fleet_state = _run_fleet_policy()
+    fleet_score = get("/tasks/fleet_strategy/score")["score"]
 
     result = {
-        "cleanup_unattached": score_cleanup,
-        "rightsize_compute": score_rightsize,
-        "fleet_strategy": score_fleet,
-        "final_projected_bill": final_state["cost_data"]["projected_monthly_bill"],
-        "final_latency_ms": final_state["health_status"]["system_latency_ms"],
+        "cleanup_unattached": cleanup_score,
+        "rightsize_compute": rightsize_score,
+        "fleet_strategy": fleet_score,
+        "cleanup_final_bill": cleanup_state["cost_data"]["projected_monthly_bill"],
+        "rightsize_final_bill": rightsize_state["cost_data"]["projected_monthly_bill"],
+        "fleet_final_bill": fleet_state["cost_data"]["projected_monthly_bill"],
+        "fleet_final_latency_ms": fleet_state["health_status"]["system_latency_ms"],
     }
     print(json.dumps(result, indent=2))
 
