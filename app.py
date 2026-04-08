@@ -605,7 +605,7 @@ async def reset():
         "observation": obs_dict,
         "reward": 0.0,
         "done": False,
-        "step": 0
+        "info": {}
     }
 
 
@@ -618,7 +618,7 @@ async def reset_get():
         "observation": obs_dict,
         "reward": 0.0,
         "done": False,
-        "step": 0
+        "info": {}
     }
 
 @app.post("/step")
