@@ -1,3 +1,4 @@
+import os
 import random
 import uuid
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from .models import (
     ModifyInstanceAction,
     Observation,
     PurchaseSavingsPlanAction,
+    Reward,
     TagResourceAction,
 )
 
@@ -34,6 +36,9 @@ class FinOpsEngine:
     }
 
     def __init__(self) -> None:
+        seed_text = os.getenv("FINOPS_SEED")
+        self.seed: Optional[int] = int(seed_text) if seed_text and seed_text.strip() else None
+        self.rng = random.Random(self.seed) if self.seed is not None else random.Random()
         self.resources: List[CloudResource] = []
         self.system_latency_ms: float = 80.0
         self.initial_bill: float = 0.0
@@ -50,9 +55,18 @@ class FinOpsEngine:
         self.idle_test_instance_ids: List[str] = []
         self.initial_unattached_volume_cost: float = 0.0
         self.initial_idle_test_cost: float = 0.0
+        self.reset_counter: int = 0
         self.reset()
 
+    def _make_id(self, prefix: str, length: int = 8) -> str:
+        if self.seed is None:
+            return f"{prefix}-{uuid.uuid4().hex[:length]}"
+        hex_chars = "0123456789abcdef"
+        suffix = "".join(self.rng.choice(hex_chars) for _ in range(length))
+        return f"{prefix}-{suffix}"
+
     def reset(self) -> Observation:
+        self.reset_counter += 1
         self.resources = []
         self.step_count = 0
         self.throttling_events = 0
@@ -64,13 +78,13 @@ class FinOpsEngine:
         for idx in range(10):
             self.resources.append(
                 CloudResource(
-                    id=f"i-{uuid.uuid4().hex[:8]}",
+                    id=self._make_id("i", 8),
                     category="compute",
                     resource_type="m5.xlarge",
                     monthly_cost=150.0,
-                    cpu_usage_pct_30d=random.uniform(1.2, 4.8),
-                    memory_usage_pct_30d=random.uniform(8.0, 22.0),
-                    network_io_mbps_30d=random.uniform(3.0, 20.0),
+                    cpu_usage_pct_30d=self.rng.uniform(1.2, 4.8),
+                    memory_usage_pct_30d=self.rng.uniform(8.0, 22.0),
+                    network_io_mbps_30d=self.rng.uniform(3.0, 20.0),
                     is_attached=True,
                     is_production=idx < 6,
                     tags={"env": "prod" if idx < 6 else "staging"},
@@ -81,7 +95,7 @@ class FinOpsEngine:
         for _ in range(5):
             self.resources.append(
                 CloudResource(
-                    id=f"vol-{uuid.uuid4().hex[:8]}",
+                    id=self._make_id("vol", 8),
                     category="storage",
                     resource_type="gp3",
                     monthly_cost=22.0,
@@ -98,13 +112,13 @@ class FinOpsEngine:
         for _ in range(2):
             self.resources.append(
                 CloudResource(
-                    id=f"i-test-{uuid.uuid4().hex[:6]}",
+                    id=self._make_id("i-test", 6),
                     category="compute",
                     resource_type="m5.large",
                     monthly_cost=90.0,
-                    cpu_usage_pct_30d=random.uniform(0.3, 1.2),
-                    memory_usage_pct_30d=random.uniform(2.0, 8.0),
-                    network_io_mbps_30d=random.uniform(0.1, 2.0),
+                    cpu_usage_pct_30d=self.rng.uniform(0.3, 1.2),
+                    memory_usage_pct_30d=self.rng.uniform(2.0, 8.0),
+                    network_io_mbps_30d=self.rng.uniform(0.1, 2.0),
                     is_attached=True,
                     is_production=False,
                     tags={"env": "test", "lifecycle": "idle"},
@@ -114,7 +128,7 @@ class FinOpsEngine:
         # Hard task mixed fleet: one legacy compute and one legacy DB.
         self.resources.append(
             CloudResource(
-                id=f"legacy-{uuid.uuid4().hex[:6]}",
+                id=self._make_id("legacy", 6),
                 category="compute",
                 resource_type="m5.xlarge",
                 monthly_cost=160.0,
@@ -129,7 +143,7 @@ class FinOpsEngine:
         )
         self.resources.append(
             CloudResource(
-                id=f"db-legacy-{uuid.uuid4().hex[:6]}",
+                id=self._make_id("db-legacy", 6),
                 category="database",
                 resource_type="db.r6g.large",
                 monthly_cost=320.0,
@@ -146,7 +160,7 @@ class FinOpsEngine:
         # Critical production database that must not be deleted.
         self.resources.append(
             CloudResource(
-                id=f"db-prod-{uuid.uuid4().hex[:6]}",
+                id=self._make_id("db-prod", 6),
                 category="database",
                 resource_type="db.r6g.xlarge",
                 monthly_cost=520.0,
@@ -186,34 +200,40 @@ class FinOpsEngine:
         )
         return self.get_observation("Environment reset. Optimization opportunities loaded.")
 
-    def step(self, action: Action) -> Tuple[Observation, float, bool, dict]:
+    def step(self, action: Action) -> Tuple[Observation, Reward, bool, dict]:
         self.step_count += 1
         previous_bill = self.get_effective_bill()
-        reward = 0.0
+        action_reward = 0.0
         status_message = "No-op."
         info: Dict[str, float] = {}
 
         if isinstance(action, DeleteResourceAction):
-            reward, status_message = self._handle_delete(action)
+            action_reward, status_message = self._handle_delete(action)
         elif isinstance(action, ModifyInstanceAction):
-            reward, status_message = self._handle_modify(action)
+            action_reward, status_message = self._handle_modify(action)
         elif isinstance(action, PurchaseSavingsPlanAction):
-            reward, status_message = self._handle_savings_plan(action)
+            action_reward, status_message = self._handle_savings_plan(action)
         elif isinstance(action, TagResourceAction):
-            reward, status_message = self._handle_tag(action)
+            action_reward, status_message = self._handle_tag(action)
 
         self._recalculate_latency()
         current_bill = self.get_effective_bill()
         bill_delta = previous_bill - current_bill
 
         # Progress signal from the spec: positive when projected bill decreases.
-        reward += bill_delta / 200.0
+        bill_change_reward = bill_delta / 200.0
+        reward_total = action_reward + bill_change_reward
+        reward = Reward(
+            total=round(reward_total, 4),
+            action_reward=round(action_reward, 4),
+            bill_change_reward=round(bill_change_reward, 4),
+        )
 
         done = self.step_count >= self.max_steps or current_bill <= self.initial_bill * 0.55
         info["monthly_bill_delta"] = round(bill_delta, 2)
         info["effective_monthly_bill"] = round(current_bill, 2)
 
-        return self.get_observation(status_message), round(reward, 4), done, info
+        return self.get_observation(status_message), reward, done, info
 
     def _handle_delete(self, action: DeleteResourceAction) -> Tuple[float, str]:
         target = self._find_resource(action.resource_id)
@@ -267,7 +287,27 @@ class FinOpsEngine:
             self.throttling_events += 1
             reward -= 0.5
 
+        self._apply_resize_noise(target)
+
         return reward, f"Modified {target.id} from {current_profile} to {action.new_type}."
+
+    def _apply_resize_noise(self, modified_target: CloudResource) -> None:
+        # Small stochastic drift after infra changes to mimic real workload variance.
+        for resource in self.resources:
+            if resource.category != "compute":
+                continue
+            cpu_drift = self.rng.uniform(-2.0, 3.0)
+            mem_drift = self.rng.uniform(-1.5, 2.0)
+            resource.cpu_usage_pct_30d = max(0.0, min(100.0, resource.cpu_usage_pct_30d + cpu_drift))
+            resource.memory_usage_pct_30d = max(0.0, min(100.0, resource.memory_usage_pct_30d + mem_drift))
+
+        # Occasional spike on production compute after a resize action.
+        if self.rng.random() < 0.2:
+            prod_compute = [r for r in self.resources if r.category == "compute" and r.is_production]
+            if prod_compute:
+                spike_target = self.rng.choice(prod_compute)
+                spike = self.rng.uniform(12.0, 25.0)
+                spike_target.cpu_usage_pct_30d = min(100.0, spike_target.cpu_usage_pct_30d + spike)
 
     def _handle_savings_plan(self, action: PurchaseSavingsPlanAction) -> Tuple[float, str]:
         if any(plan.plan_type == action.plan_type and plan.duration == action.duration for plan in self.savings_plans):

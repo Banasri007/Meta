@@ -1,84 +1,99 @@
 import json
 import os
+from typing import Dict, List
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
-# Set this to your HF Space API URL, not the huggingface.co/spaces page.
-# Example: https://mahekgupta312006-finops-optimizer.hf.space
 BASE_URL = os.getenv("FINOPS_BASE_URL", "https://mahekgupta312006-finops-optimizer.hf.space")
 
 
-def parse_json_response(response: requests.Response):
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        raise RuntimeError(
-            f"HTTP {response.status_code} calling {response.url}: {response.text[:300]}"
-        ) from exc
+def _create_session_with_retries():
+    """Create a requests session with retry strategy."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
-    try:
-        return response.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Expected JSON from {response.url}, but got: {response.text[:300] or '<empty response>'}"
-        ) from exc
 
-def run_baseline():
-    print("🚀 Starting FinOps Agent Baseline...")
-    
-    # 1. Reset the environment
-    print("\n--- Resetting Environment ---")
-    res = requests.post(f"{BASE_URL}/reset", timeout=30)
-    obs = parse_json_response(res)
-    print(f"Initial Monthly Bill: ${obs['cost_data']['projected_monthly_bill']}")
+_session = _create_session_with_retries()
 
-    # 2. Perform 'Easy Task' - Delete unattached volumes
-    print("\n--- Task 1: Deleting Unattached Volumes ---")
-    for resource in obs['inventory']:
-        if not resource['is_attached']:
-            print(f"Cleaning up idle resource: {resource['id']}")
-            requests.post(
-                f"{BASE_URL}/step",
-                json={
-                    "action_type": "delete_resource",
-                    "resource_id": resource["id"],
-                },
-                timeout=30,
-            )
 
-    # 3. Check Easy Task Score
-    score_res = requests.get(f"{BASE_URL}/tasks/cleanup_unattached/score", timeout=30)
-    print(f"✅ Easy Task Score: {parse_json_response(score_res)['score']}")
+def parse_json_response(response: requests.Response) -> Dict:
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Expected object response")
+    return payload
 
-    # 4. Perform 'Medium Task' - Resize underutilized VM
-    print("\n--- Task 2: Right-sizing Compute ---")
-    state_res = requests.get(f"{BASE_URL}/state")
-    current_obs = state_res.json()
-    
-    # Find a VM with low CPU
-    for resource in current_obs['inventory']:
-        if resource['category'] == 'compute' and resource.get('cpu_usage_pct_30d', 0) < 10:
-            print(f"Scaling down {resource['id']} (CPU: {resource.get('cpu_usage_pct_30d', 0)}%)")
-            requests.post(
-                f"{BASE_URL}/step",
-                json={
+
+def post(path: str, payload: Dict) -> Dict:
+    return parse_json_response(_session.post(f"{BASE_URL}{path}", json=payload, timeout=30))
+
+
+def get(path: str) -> Dict:
+    return parse_json_response(_session.get(f"{BASE_URL}{path}", timeout=30))
+
+
+def run_baseline() -> None:
+    print("Starting FinOps baseline rollout...")
+    state = post("/reset", {})
+    print(f"Initial projected monthly bill: ${state['cost_data']['projected_monthly_bill']}")
+
+    inventory: List[Dict] = state["inventory"]
+
+    # Easy: remove unattached storage + idle test instances.
+    for resource in inventory:
+        is_unattached_volume = resource["category"] == "storage" and not resource["is_attached"]
+        is_idle_test = resource["category"] == "compute" and resource.get("tags", {}).get("lifecycle") == "idle"
+        if is_unattached_volume or is_idle_test:
+            post("/step", {"action_type": "delete_resource", "resource_id": resource["id"]})
+
+    # Medium: right-size all low-utilization compute nodes.
+    state = get("/state")
+    for resource in state["inventory"]:
+        if resource["category"] == "compute" and resource.get("cpu_usage_pct_30d", 0) < 5.0:
+            post(
+                "/step",
+                {
                     "action_type": "modify_instance",
-                    "instance_id": resource['id'],
+                    "instance_id": resource["id"],
                     "new_type": "t3.small",
                 },
-                timeout=30,
             )
-            break # Just do one for the baseline
 
-    # 5. Check Final Stats
-    final_state = parse_json_response(requests.get(f"{BASE_URL}/state", timeout=30))
-    print("\n--- Final Results ---")
-    print(f"Final Bill: ${final_state['cost_data']['projected_monthly_bill']}")
-    print(f"Final Latency: {final_state['health_status']['system_latency_ms']}ms")
-    
-    med_score = parse_json_response(requests.get(f"{BASE_URL}/tasks/rightsize_compute/score", timeout=30))
-    print(f"✅ Medium Task Score: {med_score['score']}")
+    # Hard: remove legacy non-prod and buy baseline coverage plans.
+    state = get("/state")
+    for resource in state["inventory"]:
+        if resource.get("is_legacy") and not resource.get("is_production"):
+            post("/step", {"action_type": "delete_resource", "resource_id": resource["id"]})
+
+    post("/step", {"action_type": "purchase_savings_plan", "plan_type": "compute", "duration": "1y"})
+    post("/step", {"action_type": "purchase_savings_plan", "plan_type": "database", "duration": "1y"})
+
+    score_cleanup = get("/tasks/cleanup_unattached/score")["score"]
+    score_rightsize = get("/tasks/rightsize_compute/score")["score"]
+    score_fleet = get("/tasks/fleet_strategy/score")["score"]
+    final_state = get("/state")
+
+    result = {
+        "cleanup_unattached": score_cleanup,
+        "rightsize_compute": score_rightsize,
+        "fleet_strategy": score_fleet,
+        "final_projected_bill": final_state["cost_data"]["projected_monthly_bill"],
+        "final_latency_ms": final_state["health_status"]["system_latency_ms"],
+    }
+    print(json.dumps(result, indent=2))
+
 
 if __name__ == "__main__":
     run_baseline()

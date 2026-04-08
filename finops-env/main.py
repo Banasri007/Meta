@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 from env.engine import FinOpsEngine
 from env.models import Action, Observation
@@ -6,6 +7,16 @@ from env.tasks import get_task_score as compute_task_score, list_tasks
 
 # 1. Initialize the FastAPI app and our Simulation Engine
 app = FastAPI(title="OpenEnv FinOps Optimizer")
+
+# Enable CORS for frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins (frontend + future clients)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 env = FinOpsEngine()
 
 @app.get("/")
@@ -33,7 +44,8 @@ async def step(action: Action):
         obs, reward, done, info = env.step(action)
         return {
             "observation": obs,
-            "reward": reward,
+            "reward": reward.total,
+            "reward_detail": reward,
             "done": done,
             "info": info
         }

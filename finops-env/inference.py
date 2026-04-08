@@ -1,5 +1,6 @@
 import json
 import os
+import random
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -12,7 +13,7 @@ load_dotenv()
 # MANDATORY environment variables (participant must configure these).
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 # Environment endpoint where the FinOps OpenEnv API is running.
@@ -24,6 +25,11 @@ SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.5"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "220"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "45"))
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "20"))
+EXPLORE_RATE = float(os.getenv("EXPLORE_RATE", "0.1"))
+POLICY_SEED_TEXT = os.getenv("POLICY_SEED") or os.getenv("FINOPS_SEED")
+POLICY_SEED = int(POLICY_SEED_TEXT) if POLICY_SEED_TEXT and POLICY_SEED_TEXT.strip() else None
+POLICY_RNG = random.Random(POLICY_SEED) if POLICY_SEED is not None else random.Random()
 
 SYSTEM_PROMPT = (
     "You are a FinOps optimization agent. Output EXACTLY one JSON object and nothing else. "
@@ -121,7 +127,36 @@ def heuristic_action(observation: Dict[str, Any]) -> Dict[str, Any]:
     return {"action_type": "purchase_savings_plan", "plan_type": "compute", "duration": "1y"}
 
 
+def exploratory_action(observation: Dict[str, Any]) -> Dict[str, Any]:
+    inventory = observation.get("inventory", [])
+    candidates: List[Dict[str, Any]] = []
+
+    for resource in inventory:
+        if resource.get("category") == "storage" and not resource.get("is_attached", True):
+            candidates.append({"action_type": "delete_resource", "resource_id": resource.get("id", "")})
+        if resource.get("category") == "compute" and resource.get("tags", {}).get("lifecycle") == "idle":
+            candidates.append({"action_type": "delete_resource", "resource_id": resource.get("id", "")})
+        if (
+            resource.get("category") == "compute"
+            and float(resource.get("cpu_usage_pct_30d", 0)) < 10.0
+            and resource.get("resource_type") != "t3.small"
+        ):
+            candidates.append(
+                {
+                    "action_type": "modify_instance",
+                    "instance_id": resource.get("id", ""),
+                    "new_type": POLICY_RNG.choice(["t3.small", "t3.medium"]),
+                }
+            )
+
+    candidates.append({"action_type": "purchase_savings_plan", "plan_type": "compute", "duration": "1y"})
+    return POLICY_RNG.choice(candidates)
+
+
 def propose_action(client: Optional[OpenAI], observation: Dict[str, Any], task_name: str) -> Dict[str, Any]:
+    if POLICY_RNG.random() < EXPLORE_RATE:
+        return exploratory_action(observation)
+
     if client is None:
         return heuristic_action(observation)
 
@@ -142,6 +177,7 @@ def propose_action(client: Optional[OpenAI], observation: Dict[str, Any], task_n
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
             stream=False,
+            timeout=LLM_TIMEOUT,
         )
         content = (response.choices[0].message.content or "").strip()
         parsed = json.loads(content)
@@ -156,7 +192,12 @@ def propose_action(client: Optional[OpenAI], observation: Dict[str, Any], task_n
 def run_episode() -> None:
     client: Optional[OpenAI]
     try:
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY) if API_KEY else None
+        client = OpenAI(
+            base_url=API_BASE_URL,
+            api_key=API_KEY,
+            timeout=LLM_TIMEOUT,
+            max_retries=1,
+        ) if API_KEY else None
     except Exception:
         client = None
 

@@ -3,6 +3,7 @@ name: "finops-optimizer"
 version: "0.1.0"
 description: "A real-world simulation for cloud cost optimization (FinOps)."
 tags:
+  - "openenv"
   - "finops"
   - "cloud-cost"
   - "optimization"
