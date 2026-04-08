@@ -294,6 +294,13 @@ async def reset():
         "status_message": initial_obs.status_message if hasattr(initial_obs, 'status_message') else "Environment reset"
     }
 
+
+@app.get("/reset")
+async def reset_get():
+    """Browser-friendly reset alias (GET)."""
+    initial_obs = env.reset()
+    return initial_obs
+
 @app.post("/step")
 async def step(action: Action):
     """Execute action"""
