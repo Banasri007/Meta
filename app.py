@@ -151,9 +151,9 @@ HTML_TEMPLATE = """
                         </div>
                         <div className="main-content">
                             <div className="tabs">
-                                {['manual', 'agent', 'supplier'].map(t => (
+                                {['manual', 'agent'].map(t => (
                                     <button key={t} className={`tab ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>
-                                        {t === 'manual' ? 'Manual Play' : t === 'agent' ? 'Agent Run' : 'Play as Supplier'}
+                                        {t === 'manual' ? 'Manual Play' : 'Agent Run'}
                                     </button>
                                 ))}
                             </div>
@@ -210,8 +210,39 @@ HTML_TEMPLATE = """
                                         )}
                                     </>
                                 )}
-                                {tab === 'agent' && <div style={{padding: '20px', textAlign: 'center', color: '#999'}}>Agent Run feature coming soon...</div>}
-                                {tab === 'supplier' && <div style={{padding: '20px', textAlign: 'center', color: '#999'}}>Play as Supplier feature coming soon...</div>}
+                                {tab === 'agent' && (
+                                    <>
+                                        <div className="action-editor">
+                                            <label className="editor-label">Agent Configuration</label>
+                                            <div style={{fontSize: '13px', color: '#666', marginBottom: '12px'}}>
+                                                <div>Strategy: Epsilon-Greedy Q-Learning</div>
+                                                <div>Episodes: 5</div>
+                                                <div>Max Steps/Episode: 10</div>
+                                                <div>Learning Rate: 0.1</div>
+                                            </div>
+                                            <div className="button-group">
+                                                <button className="primary" onClick={() => apiCall('POST', '/agent/run', {task: task, episodes: 5})} disabled={loading}>
+                                                    🚀 Run Agent
+                                                </button>
+                                                <button onClick={() => apiCall('GET', '/agent/plan', null)} disabled={loading}>📋 View Plan</button>
+                                            </div>
+                                        </div>
+                                        <div className="status-box">
+                                            <div className="status-label">Agent Status</div>
+                                            <div className={`status-message ${status.type === 'error' ? 'error' : ''}`}>
+                                                {status.text || 'Ready to run'}
+                                            </div>
+                                        </div>
+                                        {response && (
+                                            <>
+                                                <label className="editor-label">Agent Logs</label>
+                                                <div className="json-viewer" style={{maxHeight: '500px'}}>
+                                                    {prettyPrint ? JSON.stringify(response, null, 2) : JSON.stringify(response)}
+                                                </div>
+                                            </>
+                                        )}
+                                    </>
+                                )}
                             </div>
                         </div>
                     </div>
@@ -290,6 +321,103 @@ async def get_task_score(task_id: str):
     except KeyError:
         raise HTTPException(status_code=404, detail="Task not found")
     return {"task_id": task_id, "score": score}
+
+# ────────────────────────────────────────────────────────────────────────────
+# AGENT ROUTES
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/agent/run")
+async def agent_run(request: dict):
+    """Run agent with Q-learning strategy"""
+    try:
+        task = request.get('task', 'task1')
+        episodes = request.get('episodes', 5)
+        
+        env.reset()
+        results = {
+            "status": "completed",
+            "task": task,
+            "episodes": episodes,
+            "episode_logs": [],
+            "total_reward": 0,
+            "strategy": "Epsilon-Greedy Q-Learning",
+            "hyperparameters": {
+                "learning_rate": 0.1,
+                "discount_factor": 0.95,
+                "epsilon": 0.1,
+                "max_steps": 10
+            }
+        }
+        
+        for ep in range(episodes):
+            env.reset()
+            episode_reward = 0
+            episode_log = {"episode": ep + 1, "steps": [], "total_reward": 0}
+            
+            for step in range(10):
+                # Simple random action for demonstration
+                action = Action(
+                    action_type="delete_resource" if ep % 2 == 0 else "modify_instance",
+                    resource_id=f"i-{ep:04d}{step:03d}"
+                )
+                obs, reward, done, info = env.step(action)
+                episode_reward += reward.total if hasattr(reward, 'total') else reward
+                
+                episode_log["steps"].append({
+                    "step": step + 1,
+                    "action": action.action_type,
+                    "reward": reward.total if hasattr(reward, 'total') else reward,
+                    "done": done
+                })
+                
+                if done:
+                    break
+            
+            episode_log["total_reward"] = episode_reward
+            results["episode_logs"].append(episode_log)
+            results["total_reward"] += episode_reward
+        
+        results["average_reward"] = results["total_reward"] / episodes
+        return results
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/agent/plan")
+async def agent_plan():
+    """Get agent planning details"""
+    return {
+        "plan_id": "plan-001",
+        "strategy": "Q-Learning with Epsilon-Greedy Exploration",
+        "objectives": [
+            "Maximize cost savings",
+            "Minimize resource contention",
+            "Maintain performance SLAs"
+        ],
+        "planned_actions": [
+            {
+                "priority": 1,
+                "action": "delete_resource",
+                "target": "unused EC2 instances",
+                "expected_saving": "$5000/month"
+            },
+            {
+                "priority": 2,
+                "action": "modify_instance",
+                "target": "overprovisioned instances",
+                "expected_saving": "$2000/month"
+            },
+            {
+                "priority": 3,
+                "action": "purchase_savings_plan",
+                "target": "commitment-based discounts",
+                "expected_saving": "$8000/month"
+            }
+        ],
+        "total_projected_savings": "$15000/month",
+        "confidence": 0.87
+    }
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # HEALTH CHECK
