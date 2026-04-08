@@ -266,15 +266,12 @@ textarea:disabled{background:#f9f9f9;color:#aaa}
 <div id="root"></div>
 <script type="text/babel">
 const {useState, useCallback} = React;
-
 const TASK_DESC = {
   task1: "Task 1: Reduce EC2 Costs. Delete unused compute resources.",
   task2: "Task 2: Optimize Storage. Modify storage tier to cheaper options.",
   task3: "Task 3: Maximize Savings. Purchase reserved capacity plans.",
 };
-
 const DEFAULT_ACTION = JSON.stringify({action_type:"delete_resource",resource_id:"i-0abc123"},null,2);
-
 function metric(label, value, cls="") {
   return (
     <div className="metric">
@@ -283,7 +280,6 @@ function metric(label, value, cls="") {
     </div>
   );
 }
-
 function App() {
   const [task,     setTask]     = useState("task1");
   const [tab,      setTab]      = useState("manual");
@@ -292,7 +288,6 @@ function App() {
   const [data,     setData]     = useState(null);   // last full API response
   const [loading,  setLoading]  = useState(false);
   const [pretty,   setPretty]   = useState(true);
-
   // ── API helper ───────────────────────────────────────────────────────────
   const call = useCallback(async (method, url, body=null) => {
     setLoading(true);
@@ -311,7 +306,6 @@ function App() {
       setLoading(false);
     }
   }, []);
-
   const handleReset = () => call("POST", "/reset");
   const handleState = () => call("GET",  "/state");
   const handleStep  = () => {
@@ -323,7 +317,6 @@ function App() {
   };
   const handleAgentRun  = () => call("POST", "/agent/run",  {task, episodes:5});
   const handleAgentPlan = () => call("GET",  "/agent/plan");
-
   // ── read from unified response shape: data.observation.* ────────────────
   const obs    = data?.observation   || {};
   const cd     = obs.cost_data       || {};
@@ -331,12 +324,10 @@ function App() {
   const inv    = obs.inventory       || [];
   const reward = data?.reward        ?? 0;
   const done   = data?.done          ?? false;
-
   const bill     = cd.projected_monthly_bill ?? 0;
   const latency  = hs.system_latency_ms      ?? 0;
   const throttle = hs.throttling_events      ?? 0;
   const downtime = hs.downtime_events        ?? 0;
-
   return (
     <>
       {/* ── Header ─────────────────────────────────────────────────────── */}
@@ -347,7 +338,6 @@ function App() {
         </div>
         <div className="stage-badge">Stage: {task}</div>
       </div>
-
       <div className="container">
         {/* ── Sidebar ──────────────────────────────────────────────────── */}
         <div className="sidebar">
@@ -361,16 +351,12 @@ function App() {
               ))}
             </div>
           </div>
-
           <div className="task-desc">{TASK_DESC[task]}</div>
-
           <hr className="divider"/>
-
           <div>
             <div className="section-label">Quick Connect</div>
             <pre className="code-block">{`from env.engine import FinOpsEngine
 from env.models import Action
-
 env = FinOpsEngine()
 obs = env.reset()
 obs, r, done, info = env.step(
@@ -379,9 +365,7 @@ obs, r, done, info = env.step(
     resource_id="i-0abc123")
 )`}</pre>
           </div>
-
           <hr className="divider"/>
-
           <div>
             <div className="section-label">Example Action</div>
             <pre className="code-block">{`{
@@ -391,7 +375,6 @@ obs, r, done, info = env.step(
     "i-0abc123"
 }`}</pre>
           </div>
-
           {inv.length > 0 && (
             <>
               <hr className="divider"/>
@@ -408,7 +391,6 @@ obs, r, done, info = env.step(
             </>
           )}
         </div>
-
         {/* ── Main ─────────────────────────────────────────────────────── */}
         <div className="main">
           <div className="tabs">
@@ -416,12 +398,9 @@ obs, r, done, info = env.step(
               <button key={v} className={"tab"+(tab===v?" active":"")} onClick={()=>setTab(v)}>{l}</button>
             ))}
           </div>
-
           <div className="content">
-
             {/* ── Manual Play tab ────────────────────────────────────── */}
             {tab === "manual" && <>
-
               {/* Metrics */}
               <div className="metrics-row">
                 {metric("Bill Amount",  "$"+bill.toFixed(2))}
@@ -430,7 +409,6 @@ obs, r, done, info = env.step(
                 {metric("Downtime",     downtime, downtime>0?"red":"")}
                 {metric("Reward",       (reward>=0?"+":"")+reward.toFixed(3), reward>0?"green":reward<0?"red":"")}
               </div>
-
               {/* Action editor */}
               <div className="action-card">
                 <label className="editor-label">Action (JSON)</label>
@@ -446,13 +424,11 @@ obs, r, done, info = env.step(
                   <button className="btn"          onClick={handleState} disabled={loading}>ℹ State</button>
                 </div>
               </div>
-
               {/* Status */}
               <div className="status-card">
                 <div className="status-label">Status</div>
                 <div className={"status-text "+status.type}>{status.text || "Ready"}</div>
               </div>
-
               {/* JSON response */}
               {data && <>
                 <div className="pp-row">
@@ -464,7 +440,6 @@ obs, r, done, info = env.step(
                 </pre>
               </>}
             </>}
-
             {/* ── Agent Run tab ──────────────────────────────────────── */}
             {tab === "agent" && <>
               <div className="action-card">
@@ -481,12 +456,10 @@ obs, r, done, info = env.step(
                   <button className="btn"          onClick={handleAgentPlan} disabled={loading}>📋 View Plan</button>
                 </div>
               </div>
-
               <div className="status-card">
                 <div className="status-label">Agent Status</div>
                 <div className={"status-text "+status.type}>{status.text || "Ready to run"}</div>
               </div>
-
               {data && <>
                 <div className="pp-row">
                   <input type="checkbox" id="pp2" checked={pretty} onChange={e=>setPretty(e.target.checked)}/>
@@ -497,14 +470,12 @@ obs, r, done, info = env.step(
                 </pre>
               </>}
             </>}
-
           </div>
         </div>
       </div>
     </>
   );
 }
-
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
 </script>
 </body>
