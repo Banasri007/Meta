@@ -48,6 +48,7 @@ class FinOpsEngine:
         self.throttling_events: int = 0
         self.downtime_events: int = 0
         self.critical_failures: int = 0
+        self.change_pressure: float = 0.0
         self.savings_plans: List[SavingsPlan] = []
         self.baseline_cost_by_id: Dict[str, float] = {}
         self.underutilized_vm_ids: List[str] = []
@@ -72,6 +73,7 @@ class FinOpsEngine:
         self.throttling_events = 0
         self.downtime_events = 0
         self.critical_failures = 0
+        self.change_pressure = 0.0
         self.savings_plans = []
 
         # Medium task candidates: 10 over-provisioned VMs (<5% CPU).
@@ -232,6 +234,9 @@ class FinOpsEngine:
         done = self.step_count >= self.max_steps or current_bill <= self.initial_bill * 0.55
         info["monthly_bill_delta"] = round(bill_delta, 2)
         info["effective_monthly_bill"] = round(current_bill, 2)
+        info["system_latency_ms"] = round(self.system_latency_ms, 2)
+        info["throttling_events"] = int(self.throttling_events)
+        info["downtime_events"] = int(self.downtime_events)
 
         return self.get_observation(status_message), reward, done, info
 
@@ -252,6 +257,9 @@ class FinOpsEngine:
             reward += 0.1
         if target.is_production and target.category == "compute":
             reward -= 0.2
+            self.change_pressure += 1.2
+        else:
+            self.change_pressure += 0.25
 
         self.resources = [resource for resource in self.resources if resource.id != target.id]
         return reward, f"Deleted resource {target.id}."
@@ -281,11 +289,20 @@ class FinOpsEngine:
         target.memory_usage_pct_30d = min(100.0, target.memory_usage_pct_30d * (old_capacity / new_capacity))
 
         reward = max(0.0, (old_cost - target.monthly_cost) / 250.0)
+        self.change_pressure += 0.8
 
         # Penalty from the spec if throttling occurs after resize.
         if expected_cpu >= 100.0:
             self.throttling_events += 1
             reward -= 0.5
+        elif target.is_production and expected_cpu >= 75.0:
+            # Production downsizing near saturation increases throttle risk.
+            self.throttling_events += 1
+            reward -= 0.2
+
+        if target.is_production and expected_cpu >= 92.0:
+            self.downtime_events += 1
+            reward -= 0.4
 
         self._apply_resize_noise(target)
 
@@ -340,7 +357,23 @@ class FinOpsEngine:
         ]
         severe_over_utilized = [resource for resource in over_utilized_production if resource.cpu_usage_pct_30d >= 100.0]
         latency_from_risk = len(over_utilized_production) * 28.0 + len(severe_over_utilized) * 45.0
-        self.system_latency_ms = self.base_latency_ms + latency_from_risk + (self.throttling_events * 12.0)
+        latency_from_operational_churn = self.change_pressure * 4.5
+        self.system_latency_ms = (
+            self.base_latency_ms
+            + latency_from_risk
+            + latency_from_operational_churn
+            + (self.throttling_events * 12.0)
+            + (self.downtime_events * 30.0)
+        )
+
+        # SLO pressure side-effects.
+        if self.system_latency_ms >= 185.0:
+            self.throttling_events += 1
+        if self.system_latency_ms >= 240.0:
+            self.downtime_events += 1
+
+        # Pressure naturally decays between steps.
+        self.change_pressure = max(0.0, self.change_pressure * 0.85)
 
     def _find_resource(self, resource_id: str) -> Optional[CloudResource]:
         return next((resource for resource in self.resources if resource.id == resource_id), None)
