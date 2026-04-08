@@ -7,7 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from env.engine import FinOpsEngine
-from env.models import Action
+from env.models import (
+    Action,
+    DeleteResourceAction,
+    ModifyInstanceAction,
+    PurchaseSavingsPlanAction,
+)
 from env.tasks import get_task_score as compute_task_score, list_tasks
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -448,68 +453,145 @@ async def agent_run(request: Request):
     """Run agent with Q-learning strategy"""
     try:
         body = await request.json()
-        task = body.get('task', 'task1')
-        episodes = body.get('episodes', 5)
-        
-        env.reset()
+        task = body.get("task", "task1")
+        episodes = max(1, int(body.get("episodes", 5)))
+        max_steps = max(5, int(body.get("max_steps", 25)))
+
+        task_map = {
+            "task1": "cleanup_unattached",
+            "task2": "rightsize_compute",
+            "task3": "fleet_strategy",
+        }
+        target_task_id = task_map.get(task, "cleanup_unattached")
+
+        def select_action(observation, purchased_plans):
+            inventory = observation.inventory
+
+            # Task-specific prioritization.
+            if task == "task1":
+                for resource in inventory:
+                    if resource.category == "storage" and not resource.is_attached:
+                        return DeleteResourceAction(resource_id=resource.id), {"action_type": "delete_resource", "resource_id": resource.id}
+                for resource in inventory:
+                    if resource.category == "compute" and resource.tags.get("lifecycle") == "idle":
+                        return DeleteResourceAction(resource_id=resource.id), {"action_type": "delete_resource", "resource_id": resource.id}
+                return None, None
+
+            if task == "task2":
+                for resource in inventory:
+                    if resource.category == "compute" and float(resource.cpu_usage_pct_30d or 0.0) < 5.0 and resource.resource_type != "t3.small":
+                        return (
+                            ModifyInstanceAction(instance_id=resource.id, new_type="t3.small"),
+                            {"action_type": "modify_instance", "instance_id": resource.id, "new_type": "t3.small"},
+                        )
+                return None, None
+
+            # task3: fleet strategy (hard) - aggressive but safe optimization.
+            for resource in inventory:
+                if resource.is_legacy and not resource.is_production:
+                    return DeleteResourceAction(resource_id=resource.id), {"action_type": "delete_resource", "resource_id": resource.id}
+            for resource in inventory:
+                if resource.category == "storage" and not resource.is_attached:
+                    return DeleteResourceAction(resource_id=resource.id), {"action_type": "delete_resource", "resource_id": resource.id}
+            for resource in inventory:
+                if resource.category == "compute" and resource.tags.get("lifecycle") == "idle":
+                    return DeleteResourceAction(resource_id=resource.id), {"action_type": "delete_resource", "resource_id": resource.id}
+            for resource in inventory:
+                if resource.category == "compute" and float(resource.cpu_usage_pct_30d or 0.0) < 5.0 and resource.resource_type != "t3.small":
+                    return (
+                        ModifyInstanceAction(instance_id=resource.id, new_type="t3.small"),
+                        {"action_type": "modify_instance", "instance_id": resource.id, "new_type": "t3.small"},
+                    )
+            if not purchased_plans["compute"]:
+                purchased_plans["compute"] = True
+                return (
+                    PurchaseSavingsPlanAction(plan_type="compute", duration="1y"),
+                    {"action_type": "purchase_savings_plan", "plan_type": "compute", "duration": "1y"},
+                )
+            if not purchased_plans["database"]:
+                purchased_plans["database"] = True
+                return (
+                    PurchaseSavingsPlanAction(plan_type="database", duration="1y"),
+                    {"action_type": "purchase_savings_plan", "plan_type": "database", "duration": "1y"},
+                )
+            return None, None
+
         results = {
             "status": "completed",
             "task": task,
+            "target_task_id": target_task_id,
             "episodes": episodes,
             "episode_logs": [],
             "total_reward": 0.0,
-            "strategy": "Epsilon-Greedy Q-Learning",
+            "best_episode_score": 0.0,
+            "best_episode_cost_reduction_pct": 0.0,
+            "strategy": "Greedy FinOps optimizer (task-aware)",
             "hyperparameters": {
-                "learning_rate": 0.1,
-                "discount_factor": 0.95,
-                "epsilon": 0.1,
-                "max_steps": 10
-            }
+                "episodes": episodes,
+                "max_steps": max_steps,
+                "policy": "task-priority deterministic",
+            },
         }
-        
+
         for ep in range(episodes):
-            env.reset()
+            initial_obs = env.reset()
+            initial_bill = float(initial_obs.cost_data.projected_monthly_bill)
             episode_reward = 0.0
-            episode_log = {"episode": ep + 1, "steps": [], "total_reward": 0.0}
-            
-            for step in range(10):
-                try:
-                    # Alternate between actions
-                    action = Action(
-                        action_type="delete_resource" if ep % 2 == 0 else "modify_instance",
-                        resource_id=f"i-{ep:04d}{step:03d}"
-                    )
-                    obs, reward, done, info = env.step(action)
-                    
-                    # Extract numeric reward value
-                    reward_value = float(reward.total) if hasattr(reward, 'total') else float(reward)
-                    episode_reward += reward_value
-                    
-                    episode_log["steps"].append({
-                        "step": step + 1,
-                        "action": action.action_type,
+            purchased_plans = {"compute": False, "database": False}
+            episode_log = {
+                "episode": ep + 1,
+                "initial_bill": initial_bill,
+                "steps": [],
+                "total_reward": 0.0,
+                "final_task_score": 0.0,
+                "cost_reduction_pct": 0.0,
+            }
+
+            for step_idx in range(max_steps):
+                observation = env.get_observation("Agent planning.")
+                action_model, action_payload = select_action(observation, purchased_plans)
+                if action_model is None:
+                    break
+
+                obs, reward, done, info = env.step(action_model)
+                reward_value = float(reward.total)
+                bill_now = float(obs.cost_data.projected_monthly_bill)
+                latency_now = float(obs.health_status.system_latency_ms)
+                episode_reward += reward_value
+
+                episode_log["steps"].append(
+                    {
+                        "step": step_idx + 1,
+                        "action": action_payload,
                         "reward": reward_value,
-                        "done": bool(done)
-                    })
-                    
-                    if done:
-                        break
-                except:
-                    # If action fails, continue with next step
-                    episode_log["steps"].append({
-                        "step": step + 1,
-                        "action": "error",
-                        "reward": 0.0,
-                        "done": False
-                    })
-            
+                        "bill": bill_now,
+                        "latency_ms": latency_now,
+                        "done": bool(done),
+                        "status_message": obs.status_message,
+                        "info": info,
+                    }
+                )
+
+                if done:
+                    break
+
+            final_bill = float(env.get_observation("Episode ended.").cost_data.projected_monthly_bill)
+            cost_reduction_pct = ((initial_bill - final_bill) / initial_bill * 100.0) if initial_bill > 0 else 0.0
+            task_score = float(compute_task_score(env, target_task_id))
+
             episode_log["total_reward"] = float(episode_reward)
+            episode_log["final_task_score"] = task_score
+            episode_log["cost_reduction_pct"] = round(cost_reduction_pct, 2)
             results["episode_logs"].append(episode_log)
             results["total_reward"] += float(episode_reward)
-        
-        results["average_reward"] = float(results["total_reward"] / episodes) if episodes > 0 else 0.0
+            results["best_episode_score"] = max(results["best_episode_score"], task_score)
+            results["best_episode_cost_reduction_pct"] = max(
+                results["best_episode_cost_reduction_pct"], round(cost_reduction_pct, 2)
+            )
+
+        results["average_reward"] = float(results["total_reward"] / episodes)
         return results
-        
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Agent run error: {str(e)}")
 
