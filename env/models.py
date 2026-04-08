@@ -37,6 +37,12 @@ class Observation(BaseModel):
     status_message: str
 
 
+class Reward(BaseModel):
+    total: float
+    action_reward: float
+    bill_change_reward: float
+
+
 class ModifyInstanceAction(BaseModel):
     action_type: Literal["modify_instance"] = "modify_instance"
     instance_id: str
