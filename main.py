@@ -42,12 +42,12 @@ async def step(action: Action):
     """
     try:
         obs, reward, done, info = env.step(action)
+        reward_val = float(reward.total if hasattr(reward, 'total') else reward)
         return {
-            "observation": obs,
-            "reward": reward.total,
-            "reward_detail": reward,
-            "done": done,
-            "info": info
+            "observation": obs.dict() if hasattr(obs, 'dict') else obs,
+            "reward": reward_val,
+            "done": bool(done),
+            "info": info if isinstance(info, dict) else {}
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

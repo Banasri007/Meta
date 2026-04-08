@@ -2,7 +2,7 @@
 FinOps Cloud Optimizer - FastAPI server with embedded React UI
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
@@ -96,31 +96,31 @@ HTML_TEMPLATE = """
 
             const apiCall = async (method, endpoint, payload = null) => {
                 setLoading(true);
+                setStatus({ text: 'Loading...', type: 'info' });
                 try {
                     const options = { method, headers: { 'Content-Type': 'application/json' } };
                     if (payload) options.body = JSON.stringify(payload);
                     const resp = await fetch(endpoint, options);
-                    if (!resp.ok) throw new Error(`API error: ${resp.status}`);
                     const data = await resp.json();
+                    if (!resp.ok) throw new Error(data?.detail || `API error: ${resp.status}`);
                     setResponse(data);
-                    setStatus({ text: 'Success', type: 'success' });
-                    return data;
+                    setStatus({ text: 'Success ✓', type: 'success' });
                 } catch (err) {
+                    console.error(err);
                     setStatus({ text: `Error: ${err.message}`, type: 'error' });
                     setResponse(null);
+                } finally {
+                    setLoading(false);
                 }
-                setLoading(false);
             };
 
-            const handleReset = async () => { setLoading(true); await apiCall('POST', '/reset'); setLoading(false); };
-            const handleState = async () => { setLoading(true); await apiCall('GET', '/state'); setLoading(false); };
+            const handleReset = async () => await apiCall('POST', '/reset');
+            const handleState = async () => await apiCall('GET', '/state');
             const handleStep = async () => {
                 try {
                     const parsed = JSON.parse(action);
-                    setLoading(true);
                     await apiCall('POST', '/step', parsed);
-                    setLoading(false);
-                } catch {
+                } catch (e) {
                     setStatus({ text: 'Invalid JSON in action editor', type: 'error' });
                 }
             };
@@ -224,7 +224,7 @@ HTML_TEMPLATE = """
                                                 <button className="primary" onClick={() => apiCall('POST', '/agent/run', {task: task, episodes: 5})} disabled={loading}>
                                                     🚀 Run Agent
                                                 </button>
-                                                <button onClick={() => apiCall('GET', '/agent/plan', null)} disabled={loading}>📋 View Plan</button>
+                                                <button onClick={() => apiCall('GET', '/agent/plan')} disabled={loading}>📋 View Plan</button>
                                             </div>
                                         </div>
                                         <div className="status-box">
@@ -293,12 +293,12 @@ async def step(action: Action):
     """Execute action"""
     try:
         obs, reward, done, info = env.step(action)
+        reward_val = float(reward.total if hasattr(reward, 'total') else reward)
         return {
-            "observation": obs,
-            "reward": reward.total if hasattr(reward, 'total') else reward,
-            "reward_detail": reward,
-            "done": done,
-            "info": info
+            "observation": obs.dict() if hasattr(obs, 'dict') else obs,
+            "reward": reward_val,
+            "done": bool(done),
+            "info": info if isinstance(info, dict) else {}
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -306,7 +306,8 @@ async def step(action: Action):
 @app.get("/state")
 async def state():
     """Get current state"""
-    return env.get_observation("Current state requested.")
+    obs = env.get_observation("Current state requested.")
+    return obs.dict() if hasattr(obs, 'dict') else obs
 
 @app.get("/tasks")
 async def tasks():
@@ -327,11 +328,12 @@ async def get_task_score(task_id: str):
 # ────────────────────────────────────────────────────────────────────────────
 
 @app.post("/agent/run")
-async def agent_run(request: dict):
+async def agent_run(request: Request):
     """Run agent with Q-learning strategy"""
     try:
-        task = request.get('task', 'task1')
-        episodes = request.get('episodes', 5)
+        body = await request.json()
+        task = body.get('task', 'task1')
+        episodes = body.get('episodes', 5)
         
         env.reset()
         results = {
@@ -339,7 +341,7 @@ async def agent_run(request: dict):
             "task": task,
             "episodes": episodes,
             "episode_logs": [],
-            "total_reward": 0,
+            "total_reward": 0.0,
             "strategy": "Epsilon-Greedy Q-Learning",
             "hyperparameters": {
                 "learning_rate": 0.1,
@@ -351,37 +353,49 @@ async def agent_run(request: dict):
         
         for ep in range(episodes):
             env.reset()
-            episode_reward = 0
-            episode_log = {"episode": ep + 1, "steps": [], "total_reward": 0}
+            episode_reward = 0.0
+            episode_log = {"episode": ep + 1, "steps": [], "total_reward": 0.0}
             
             for step in range(10):
-                # Simple random action for demonstration
-                action = Action(
-                    action_type="delete_resource" if ep % 2 == 0 else "modify_instance",
-                    resource_id=f"i-{ep:04d}{step:03d}"
-                )
-                obs, reward, done, info = env.step(action)
-                episode_reward += reward.total if hasattr(reward, 'total') else reward
-                
-                episode_log["steps"].append({
-                    "step": step + 1,
-                    "action": action.action_type,
-                    "reward": reward.total if hasattr(reward, 'total') else reward,
-                    "done": done
-                })
-                
-                if done:
-                    break
+                try:
+                    # Alternate between actions
+                    action = Action(
+                        action_type="delete_resource" if ep % 2 == 0 else "modify_instance",
+                        resource_id=f"i-{ep:04d}{step:03d}"
+                    )
+                    obs, reward, done, info = env.step(action)
+                    
+                    # Extract numeric reward value
+                    reward_value = float(reward.total) if hasattr(reward, 'total') else float(reward)
+                    episode_reward += reward_value
+                    
+                    episode_log["steps"].append({
+                        "step": step + 1,
+                        "action": action.action_type,
+                        "reward": reward_value,
+                        "done": bool(done)
+                    })
+                    
+                    if done:
+                        break
+                except:
+                    # If action fails, continue with next step
+                    episode_log["steps"].append({
+                        "step": step + 1,
+                        "action": "error",
+                        "reward": 0.0,
+                        "done": False
+                    })
             
-            episode_log["total_reward"] = episode_reward
+            episode_log["total_reward"] = float(episode_reward)
             results["episode_logs"].append(episode_log)
-            results["total_reward"] += episode_reward
+            results["total_reward"] += float(episode_reward)
         
-        results["average_reward"] = results["total_reward"] / episodes
+        results["average_reward"] = float(results["total_reward"] / episodes) if episodes > 0 else 0.0
         return results
         
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Agent run error: {str(e)}")
 
 @app.get("/agent/plan")
 async def agent_plan():
