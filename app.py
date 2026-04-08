@@ -600,7 +600,7 @@ async def root():
 async def reset():
     """Reset environment"""
     initial_obs = env.reset()
-    obs_dict = initial_obs.dict() if hasattr(initial_obs, 'dict') else initial_obs
+    obs_dict = initial_obs.model_dump() if hasattr(initial_obs, 'model_dump') else initial_obs.dict()
     return {
         "observation": obs_dict,
         "reward": 0.0,
@@ -613,7 +613,7 @@ async def reset():
 async def reset_get():
     """Browser-friendly reset alias (GET)."""
     initial_obs = env.reset()
-    obs_dict = initial_obs.dict() if hasattr(initial_obs, 'dict') else initial_obs
+    obs_dict = initial_obs.model_dump() if hasattr(initial_obs, 'model_dump') else initial_obs.dict()
     return {
         "observation": obs_dict,
         "reward": 0.0,
@@ -627,7 +627,7 @@ async def step(action: Action):
     try:
         obs, reward, done, info = env.step(action)
         reward_val = float(reward.total if hasattr(reward, 'total') else reward)
-        obs_dict = obs.dict() if hasattr(obs, 'dict') else obs
+        obs_dict = obs.model_dump() if hasattr(obs, 'model_dump') else obs.dict()
         return {
             "observation": obs_dict,
             "reward": reward_val,
@@ -641,7 +641,7 @@ async def step(action: Action):
 async def state():
     """Get current state"""
     obs = env.get_observation("Current state requested.")
-    obs_dict = obs.dict() if hasattr(obs, 'dict') else obs
+    obs_dict = obs.model_dump() if hasattr(obs, 'model_dump') else obs.dict()
     return {
         "observation": obs_dict,
         "reward": 0.0,
