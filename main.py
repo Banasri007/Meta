@@ -9,7 +9,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from env.engine import FinOpsEngine
-from env.models import Action
+from env.models import (
+    Action,
+    DeleteResourceAction,
+    ModifyInstanceAction,
+    PurchaseSavingsPlanAction,
+)
 from env.tasks import get_task_score as compute_task_score, list_tasks
 
 app = FastAPI(title="FinOps Cloud Optimizer")
@@ -110,55 +115,146 @@ async def get_task_score(task_id: str):
 
 @app.post("/agent/run")
 async def agent_run(request: Request):
+    """Run agent with Q-learning strategy"""
     try:
         body = await request.json()
-        task_name = body.get("task", "task1")
-        episodes = int(body.get("episodes", 5))
+        task = body.get("task", "task1")
+        episodes = max(1, int(body.get("episodes", 5)))
+        max_steps = max(5, int(body.get("max_steps", 25)))
+
+        task_map = {
+            "task1": "cleanup_unattached",
+            "task2": "rightsize_compute",
+            "task3": "fleet_strategy",
+        }
+        target_task_id = task_map.get(task, "cleanup_unattached")
+
+        def select_action(observation, purchased_plans):
+            inventory = observation.inventory
+
+            # Task-specific prioritization.
+            if task == "task1":
+                for resource in inventory:
+                    if resource.category == "storage" and not resource.is_attached:
+                        return DeleteResourceAction(resource_id=resource.id), {"action_type": "delete_resource", "resource_id": resource.id}
+                for resource in inventory:
+                    if resource.category == "compute" and resource.tags.get("lifecycle") == "idle":
+                        return DeleteResourceAction(resource_id=resource.id), {"action_type": "delete_resource", "resource_id": resource.id}
+                return None, None
+
+            if task == "task2":
+                for resource in inventory:
+                    if resource.category == "compute" and float(resource.cpu_usage_pct_30d or 0.0) < 5.0 and resource.resource_type != "t3.small":
+                        return (
+                            ModifyInstanceAction(instance_id=resource.id, new_type="t3.small"),
+                            {"action_type": "modify_instance", "instance_id": resource.id, "new_type": "t3.small"},
+                        )
+                return None, None
+
+            # task3: fleet strategy (hard) - aggressive but safe optimization.
+            for resource in inventory:
+                if resource.is_legacy and not resource.is_production:
+                    return DeleteResourceAction(resource_id=resource.id), {"action_type": "delete_resource", "resource_id": resource.id}
+            for resource in inventory:
+                if resource.category == "storage" and not resource.is_attached:
+                    return DeleteResourceAction(resource_id=resource.id), {"action_type": "delete_resource", "resource_id": resource.id}
+            for resource in inventory:
+                if resource.category == "compute" and resource.tags.get("lifecycle") == "idle":
+                    return DeleteResourceAction(resource_id=resource.id), {"action_type": "delete_resource", "resource_id": resource.id}
+            for resource in inventory:
+                if resource.category == "compute" and float(resource.cpu_usage_pct_30d or 0.0) < 5.0 and resource.resource_type != "t3.small":
+                    return (
+                        ModifyInstanceAction(instance_id=resource.id, new_type="t3.small"),
+                        {"action_type": "modify_instance", "instance_id": resource.id, "new_type": "t3.small"},
+                    )
+            if not purchased_plans["compute"]:
+                purchased_plans["compute"] = True
+                return (
+                    PurchaseSavingsPlanAction(plan_type="compute", duration="1y"),
+                    {"action_type": "purchase_savings_plan", "plan_type": "compute", "duration": "1y"},
+                )
+            if not purchased_plans["database"]:
+                purchased_plans["database"] = True
+                return (
+                    PurchaseSavingsPlanAction(plan_type="database", duration="1y"),
+                    {"action_type": "purchase_savings_plan", "plan_type": "database", "duration": "1y"},
+                )
+            return None, None
 
         results = {
             "status": "completed",
-            "task": task_name,
+            "task": task,
+            "target_task_id": target_task_id,
             "episodes": episodes,
             "episode_logs": [],
             "total_reward": 0.0,
-            "average_reward": 0.0,
-            "strategy": "Epsilon-Greedy Q-Learning",
+            "best_episode_score": 0.0,
+            "best_episode_cost_reduction_pct": 0.0,
+            "strategy": "Greedy FinOps optimizer (task-aware)",
             "hyperparameters": {
-                "learning_rate": 0.1,
-                "discount_factor": 0.95,
-                "epsilon": 0.1,
-                "max_steps": 10,
+                "episodes": episodes,
+                "max_steps": max_steps,
+                "policy": "task-priority deterministic",
             },
         }
 
         for ep in range(episodes):
-            env.reset()
+            initial_obs = env.reset()
+            initial_bill = float(initial_obs.cost_data.projected_monthly_bill)
             episode_reward = 0.0
-            episode_log = {"episode": ep + 1, "steps": [], "total_reward": 0.0}
+            purchased_plans = {"compute": False, "database": False}
+            episode_log = {
+                "episode": ep + 1,
+                "initial_bill": initial_bill,
+                "steps": [],
+                "total_reward": 0.0,
+                "final_task_score": 0.0,
+                "cost_reduction_pct": 0.0,
+            }
 
-            for s in range(10):
-                try:
-                    action = Action(
-                        action_type="delete_resource" if ep % 2 == 0 else "modify_instance",
-                        resource_id=f"i-{ep:04d}{s:03d}",
-                    )
-                    obs, reward, done, info = env.step(action)
-                    rval = float(reward.total if hasattr(reward, "total") else reward)
-                    episode_reward += rval
-                    episode_log["steps"].append(
-                        {"step": s + 1, "action": action.action_type, "reward": rval, "done": bool(done)}
-                    )
-                    if done:
-                        break
-                except Exception:
-                    episode_log["steps"].append({"step": s + 1, "action": "error", "reward": 0.0, "done": False})
+            for step_idx in range(max_steps):
+                observation = env.get_observation("Agent planning.")
+                action_model, action_payload = select_action(observation, purchased_plans)
+                if action_model is None:
+                    break
 
-            episode_log["total_reward"] = round(episode_reward, 4)
+                obs, reward, done, info = env.step(action_model)
+                reward_value = float(reward.total)
+                bill_now = float(obs.cost_data.projected_monthly_bill)
+                latency_now = float(obs.health_status.system_latency_ms)
+                episode_reward += reward_value
+
+                episode_log["steps"].append(
+                    {
+                        "step": step_idx + 1,
+                        "action": action_payload,
+                        "reward": reward_value,
+                        "bill": bill_now,
+                        "latency_ms": latency_now,
+                        "done": bool(done),
+                        "status_message": obs.status_message,
+                        "info": info,
+                    }
+                )
+
+                if done:
+                    break
+
+            final_bill = float(env.get_observation("Episode ended.").cost_data.projected_monthly_bill)
+            cost_reduction_pct = ((initial_bill - final_bill) / initial_bill * 100.0) if initial_bill > 0 else 0.0
+            task_score = float(compute_task_score(env, target_task_id))
+
+            episode_log["total_reward"] = float(episode_reward)
+            episode_log["final_task_score"] = task_score
+            episode_log["cost_reduction_pct"] = round(cost_reduction_pct, 2)
             results["episode_logs"].append(episode_log)
-            results["total_reward"] += episode_reward
+            results["total_reward"] += float(episode_reward)
+            results["best_episode_score"] = max(results["best_episode_score"], task_score)
+            results["best_episode_cost_reduction_pct"] = max(
+                results["best_episode_cost_reduction_pct"], round(cost_reduction_pct, 2)
+            )
 
-        results["total_reward"] = round(results["total_reward"], 4)
-        results["average_reward"] = round(results["total_reward"] / episodes, 4) if episodes else 0.0
+        results["average_reward"] = float(results["total_reward"] / episodes)
         return results
 
     except Exception as e:
@@ -187,299 +283,557 @@ async def agent_plan():
 
 # ── HTML frontend ──────────────────────────────────────────────────────────────
 
-HTML_TEMPLATE = """<!DOCTYPE html>
+HTML_TEMPLATE = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>FinOps Cloud Optimizer</title>
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333}
-.header{background:#fff;border-bottom:1px solid #e0e0e0;padding:14px 24px;display:flex;justify-content:space-between;align-items:center;box-shadow:0 1px 3px rgba(0,0,0,.06)}
-.header-title{font-size:22px;font-weight:700;color:#222}
-.header-badge{background:#dbeafe;color:#1e40af;padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;margin-left:10px}
-.stage-badge{background:#dcfce7;color:#166534;padding:4px 14px;border-radius:14px;font-size:12px;font-weight:600}
-.container{display:flex;height:calc(100vh - 57px)}
-/* sidebar */
-.sidebar{width:280px;background:#fafafa;border-right:1px solid #e0e0e0;padding:20px 16px;overflow-y:auto;display:flex;flex-direction:column;gap:16px}
-.section-label{font-size:11px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}
-.task-btns{display:flex;gap:8px}
-.task-btn{flex:1;padding:8px 0;border:1px solid #ddd;background:#fff;border-radius:5px;cursor:pointer;font-size:13px;font-weight:600;transition:all .15s}
-.task-btn.active{background:#dcfce7;border-color:#4ade80;color:#166534}
-.task-btn:hover:not(.active){border-color:#aaa}
-.task-desc{font-size:13px;color:#666;line-height:1.6}
-.code-block{font-size:11px;color:#cdd9e5;background:#1e2530;padding:12px;border-radius:6px;overflow-x:auto;font-family:'JetBrains Mono','Courier New',monospace;line-height:1.5;white-space:pre-wrap;word-break:break-all}
-.divider{border:none;border-top:1px solid #e8e8e8}
-/* main */
-.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.tabs{background:#fff;border-bottom:1px solid #e0e0e0;display:flex;padding:0 20px}
-.tab{padding:13px 18px;border:none;background:none;cursor:pointer;font-size:14px;font-weight:500;color:#999;border-bottom:2.5px solid transparent;transition:all .15s}
-.tab.active{color:#222;border-bottom-color:#222}
-.content{flex:1;overflow-y:auto;padding:20px 24px;display:flex;flex-direction:column;gap:16px}
-/* metrics */
-.metrics-row{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}
-.metric{background:#fff;padding:16px 14px;border-radius:8px;border:1px solid #e8e8e8}
-.metric-label{font-size:11px;color:#999;font-weight:600;margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em}
-.metric-value{font-size:22px;font-weight:700;color:#222}
-.metric-value.green{color:#16a34a}
-.metric-value.red{color:#dc2626}
-/* action editor */
-.action-card{background:#fff;border:1px solid #e8e8e8;border-radius:8px;padding:18px}
-.editor-label{font-size:11px;font-weight:700;color:#777;text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:10px}
-textarea{width:100%;height:140px;padding:12px;border:1px solid #e0e0e0;border-radius:6px;font-family:'JetBrains Mono','Courier New',monospace;font-size:12px;resize:vertical;line-height:1.5}
-textarea:focus{outline:none;border-color:#4ade80;box-shadow:0 0 0 3px rgba(74,222,128,.12)}
-textarea:disabled{background:#f9f9f9;color:#aaa}
-.btn-row{display:flex;gap:10px;margin-top:14px}
-.btn{padding:10px 22px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;font-size:14px;font-weight:600;transition:all .15s;display:flex;align-items:center;gap:6px}
-.btn:hover:not(:disabled){border-color:#aaa}
-.btn:active:not(:disabled){transform:scale(.97)}
-.btn:disabled{opacity:.45;cursor:not-allowed}
-.btn.primary{background:#4ade80;color:#fff;border-color:#4ade80}
-.btn.primary:hover:not(:disabled){background:#22c55e;border-color:#22c55e}
-/* status */
-.status-card{background:#fff;border:1px solid #e8e8e8;border-radius:8px;padding:14px 18px}
-.status-label{font-size:11px;font-weight:700;color:#777;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
-.status-text{font-size:14px;color:#555}
-.status-text.ok{color:#16a34a}
-.status-text.error{color:#dc2626}
-.status-text.loading{color:#888}
-/* pretty print */
-.pp-row{display:flex;align-items:center;gap:8px;font-size:13px;color:#666}
-.pp-row input{accent-color:#16a34a;width:14px;height:14px;cursor:pointer}
-/* json viewer */
-.json-viewer{background:#1e2530;color:#cdd9e5;padding:16px;border-radius:8px;overflow:auto;font-family:'JetBrains Mono','Courier New',monospace;font-size:12px;line-height:1.5;max-height:420px;white-space:pre-wrap;word-break:break-word}
-/* agent */
-.agent-info{font-size:13px;color:#666;line-height:2;margin-bottom:14px}
-.agent-info span{font-weight:600;color:#333}
-/* scrollbar */
-::-webkit-scrollbar{width:7px;height:7px}
-::-webkit-scrollbar-track{background:#f5f5f5}
-::-webkit-scrollbar-thumb{background:#ccc;border-radius:4px}
-::-webkit-scrollbar-thumb:hover{background:#aaa}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FinOps Cloud Optimizer</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif; background-color: #f5f5f5; color: #333; }
+        .header { background: #fff; border-bottom: 1px solid #e0e0e0; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .header-left { display: flex; align-items: center; gap: 12px; }
+        .header-title { font-size: 24px; font-weight: 600; color: #333; }
+        .header-badge { background: #dbeafe; color: #1e40af; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
+        .header-right { display: flex; gap: 16px; align-items: center; }
+        .stage-badge { background: #dcfce7; color: #166534; padding: 4px 12px; border-radius: 16px; font-size: 12px; font-weight: 500; }
+        .container { display: flex; height: calc(100vh - 64px); }
+        .sidebar { width: 280px; background: #f9f9f9; border-right: 1px solid #e0e0e0; padding: 24px 16px; overflow-y: auto; }
+        .task-label { font-size: 12px; font-weight: 600; color: #999; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+        .task-buttons { display: flex; gap: 8px; margin-bottom: 24px; }
+        .task-btn { flex: 1; padding: 8px 12px; border: 1px solid #ddd; background: #fff; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s; }
+        .task-btn.active { background: #dcfce7; border-color: #4ade80; color: #166534; }
+        .task-btn:hover { border-color: #999; }
+        .task-desc { font-size: 13px; color: #666; line-height: 1.5; margin-bottom: 24px; }
+        .sidebar-divider { border: none; border-top: 1px solid #e0e0e0; margin: 16px 0; }
+        .code-snippet { font-size: 11px; color: #666; background: #f0f0f0; padding: 12px; border-radius: 4px; overflow: auto; max-height: 150px; font-family: 'Monaco', 'Courier New', monospace; line-height: 1.4; }
+        .main-content { flex: 1; display: flex; flex-direction: column; }
+        .tabs { background: #fff; border-bottom: 1px solid #e0e0e0; display: flex; padding: 0 24px; }
+        .tab { padding: 12px 16px; border: none; background: none; cursor: pointer; font-size: 14px; font-weight: 500; color: #999; border-bottom: 2px solid transparent; transition: all 0.2s; }
+        .tab.active { color: #333; border-bottom-color: #333; }
+        .content { flex: 1; overflow-y: auto; padding: 24px; }
+        .metrics-row { display: flex; gap: 16px; margin-bottom: 24px; }
+        .metric { flex: 1; background: #fff; padding: 16px; border-radius: 8px; border: 1px solid #e0e0e0; }
+        .metric-label { font-size: 12px; color: #999; font-weight: 500; margin-bottom: 8px; }
+        .metric-value { font-size: 24px; font-weight: 600; color: #333; }
+        .action-editor { background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .editor-label { font-size: 12px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; display: block; }
+        textarea { width: 100%; height: 150px; padding: 12px; border: 1px solid #e0e0e0; border-radius: 4px; font-family: 'Monaco', 'Courier New', monospace; font-size: 12px; resize: vertical; }
+        textarea:focus { outline: none; border-color: #4ade80; box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.1); }
+        textarea:disabled { background: #f5f5f5; color: #999; }
+        .button-group { display: flex; gap: 12px; margin-top: 16px; }
+        button { padding: 10px 20px; border: 1px solid #e0e0e0; border-radius: 4px; background: #fff; cursor: pointer; font-size: 14px; font-weight: 500; transition: all 0.2s; }
+        button.primary { background: #4ade80; color: #fff; border-color: #4ade80; }
+        button.primary:hover { background: #22c55e; }
+        button:hover { border-color: #999; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .status-box { background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .status-label { font-size: 12px; font-weight: 600; color: #666; margin-bottom: 8px; }
+        .status-message { color: #4ade80; font-size: 14px; }
+        .status-message.error { color: #ef4444; }
+        .checkbox-group { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+        .checkbox-group label { font-size: 14px; cursor: pointer; }
+        .json-viewer { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; overflow: auto; font-family: 'Monaco', 'Courier New', monospace; font-size: 12px; line-height: 1.5; max-height: 400px; }
+        .agent-summary-grid { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+        .agent-summary-card { background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px; min-width: 140px; flex: 1; }
+        .agent-summary-label { font-size: 11px; color: #888; font-weight: 600; text-transform: uppercase; margin-bottom: 6px; }
+        .agent-summary-value { font-size: 20px; font-weight: 700; color: #222; }
+        .agent-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden; }
+        .agent-table th, .agent-table td { padding: 8px 10px; font-size: 12px; border-bottom: 1px solid #f0f0f0; text-align: left; }
+        .agent-table th { background: #fafafa; color: #666; font-weight: 600; }
+        .agent-table-wrap { max-height: 280px; overflow: auto; border-radius: 8px; }
+        .inventory-section { margin-top: 20px; }
+        .inventory-label { font-size: 12px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; display: block; }
+        .inventory-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden; }
+        .inventory-table th, .inventory-table td { padding: 10px; font-size: 12px; border-bottom: 1px solid #f0f0f0; text-align: left; }
+        .inventory-table th { background: #fafafa; color: #666; font-weight: 600; }
+        .inventory-table-wrap { max-height: 400px; overflow: auto; border-radius: 8px; }
+        .resource-badge { display: inline-block; margin-right: 4px; padding: 2px 6px; font-size: 10px; border-radius: 3px; font-weight: 600; }
+        .badge-unattached { background: #fecaca; color: #991b1b; }
+        .badge-idle { background: #fed7aa; color: #92400e; }
+        .badge-legacy { background: #dbeafe; color: #1e40af; }
+        .badge-production { background: #dcfce7; color: #166534; }
+        .badge-compute { background: #e9d5ff; color: #6b21a8; }
+        .badge-storage { background: #fce7f3; color: #831843; }
+        .badge-database { background: #f3e8ff; color: #5b21b6; }
+        .resource-row-deleted { opacity: 0.5; background: #f9fafb; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f5f5f5; }
+        ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #999; }
+    </style>
 </head>
 <body>
-<div id="root"></div>
-<script type="text/babel">
-const {useState, useCallback} = React;
-const TASK_DESC = {
-  task1: "Task 1: Reduce EC2 Costs. Delete unused compute resources.",
-  task2: "Task 2: Optimize Storage. Modify storage tier to cheaper options.",
-  task3: "Task 3: Maximize Savings. Purchase reserved capacity plans.",
-};
-const DEFAULT_ACTION = JSON.stringify({action_type:"delete_resource",resource_id:"i-0abc123"},null,2);
-function metric(label, value, cls="") {
-  return (
-    <div className="metric">
-      <div className="metric-label">{label}</div>
-      <div className={"metric-value " + cls}>{value}</div>
-    </div>
-  );
-}
-function App() {
-  const [task,     setTask]     = useState("task1");
-  const [tab,      setTab]      = useState("manual");
-  const [action,   setAction]   = useState(DEFAULT_ACTION);
-  const [status,   setStatus]   = useState({text:"Ready", type:""});
-  const [data,     setData]     = useState(null);   // last full API response
-  const [loading,  setLoading]  = useState(false);
-  const [pretty,   setPretty]   = useState(true);
-  // ── API helper ───────────────────────────────────────────────────────────
-  const call = useCallback(async (method, url, body=null) => {
-    setLoading(true);
-    setStatus({text:"Loading…", type:"loading"});
-    try {
-      const opts = {method, headers:{"Content-Type":"application/json"}};
-      if(body) opts.body = JSON.stringify(body);
-      const res = await fetch(url, opts);
-      const json = await res.json();
-      if(!res.ok) throw new Error(json?.detail || "API error " + res.status);
-      setData(json);
-      setStatus({text: json?.observation?.status_message || "Success ✓", type:"ok"});
-    } catch(e) {
-      setStatus({text: "Error: " + e.message, type:"error"});
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-  const handleReset = () => call("POST", "/reset");
-  const handleState = () => call("GET",  "/state");
-  const handleStep  = () => {
-    try {
-      call("POST", "/step", JSON.parse(action));
-    } catch {
-      setStatus({text:"Invalid JSON in action editor", type:"error"});
-    }
-  };
-  const handleAgentRun  = () => call("POST", "/agent/run",  {task, episodes:5});
-  const handleAgentPlan = () => call("GET",  "/agent/plan");
-  // ── read from unified response shape: data.observation.* ────────────────
-  const obs    = data?.observation   || {};
-  const cd     = obs.cost_data       || {};
-  const hs     = obs.health_status   || {};
-  const inv    = obs.inventory       || [];
-  const reward = data?.reward        ?? 0;
-  const done   = data?.done          ?? false;
-  const bill     = cd.projected_monthly_bill ?? 0;
-  const latency  = hs.system_latency_ms      ?? 0;
-  const throttle = hs.throttling_events      ?? 0;
-  const downtime = hs.downtime_events        ?? 0;
-  return (
-    <>
-      {/* ── Header ─────────────────────────────────────────────────────── */}
-      <div className="header">
-        <div style={{display:"flex",alignItems:"center"}}>
-          <span className="header-title">FinOps</span>
-          <span className="header-badge">Cloud Optimizer</span>
-        </div>
-        <div className="stage-badge">Stage: {task}</div>
-      </div>
-      <div className="container">
-        {/* ── Sidebar ──────────────────────────────────────────────────── */}
-        <div className="sidebar">
-          <div>
-            <div className="section-label">Select Task</div>
-            <div className="task-btns">
-              {["task1","task2","task3"].map(t => (
-                <button key={t} className={"task-btn"+(task===t?" active":"")} onClick={()=>setTask(t)}>
-                  {t.replace("task","T")}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="task-desc">{TASK_DESC[task]}</div>
-          <hr className="divider"/>
-          <div>
-            <div className="section-label">Quick Connect</div>
-            <pre className="code-block">{`from env.engine import FinOpsEngine
-from env.models import Action
-env = FinOpsEngine()
-obs = env.reset()
-obs, r, done, info = env.step(
-  Action(action_type=
-    "delete_resource",
-    resource_id="i-0abc123")
-)`}</pre>
-          </div>
-          <hr className="divider"/>
-          <div>
-            <div className="section-label">Example Action</div>
-            <pre className="code-block">{`{
-  "action_type":
-    "delete_resource",
-  "resource_id":
-    "i-0abc123"
-}`}</pre>
-          </div>
-          {inv.length > 0 && (
-            <>
-              <hr className="divider"/>
-              <div>
-                <div className="section-label">Inventory ({inv.length})</div>
-                {inv.slice(0,6).map(r => (
-                  <div key={r.id} style={{fontSize:"11px",color:"#666",marginBottom:"4px",fontFamily:"monospace"}}>
-                    <span style={{color:"#333",fontWeight:600}}>{String(r.id).slice(0,14)}</span>
-                    <br/>{r.resource_type} · ${r.monthly_cost}/mo
-                  </div>
-                ))}
-                {inv.length > 6 && <div style={{fontSize:"11px",color:"#aaa"}}>+{inv.length-6} more…</div>}
-              </div>
-            </>
-          )}
-        </div>
-        {/* ── Main ─────────────────────────────────────────────────────── */}
-        <div className="main">
-          <div className="tabs">
-            {[["manual","Manual Play"],["agent","Agent Run"]].map(([v,l]) => (
-              <button key={v} className={"tab"+(tab===v?" active":"")} onClick={()=>setTab(v)}>{l}</button>
-            ))}
-          </div>
-          <div className="content">
-            {/* ── Manual Play tab ────────────────────────────────────── */}
-            {tab === "manual" && <>
-              {/* Metrics */}
-              <div className="metrics-row">
-                {metric("Bill Amount",  "$"+bill.toFixed(2))}
-                {metric("Latency (ms)", latency.toFixed(1))}
-                {metric("Throttling",   throttle, throttle>0?"red":"")}
-                {metric("Downtime",     downtime, downtime>0?"red":"")}
-                {metric("Reward",       (reward>=0?"+":"")+reward.toFixed(3), reward>0?"green":reward<0?"red":"")}
-              </div>
-              {/* Action editor */}
-              <div className="action-card">
-                <label className="editor-label">Action (JSON)</label>
-                <textarea
-                  value={action}
-                  onChange={e=>setAction(e.target.value)}
-                  disabled={loading}
-                  spellCheck={false}
-                />
-                <div className="btn-row">
-                  <button className="btn primary" onClick={handleStep}  disabled={loading}>▶ Step</button>
-                  <button className="btn"          onClick={handleReset} disabled={loading}>↺ Reset</button>
-                  <button className="btn"          onClick={handleState} disabled={loading}>ℹ State</button>
-                </div>
-              </div>
-              {/* Status */}
-              <div className="status-card">
-                <div className="status-label">Status</div>
-                <div className={"status-text "+status.type}>{status.text || "Ready"}</div>
-              </div>
-              {/* JSON response */}
-              {data && <>
-                <div className="pp-row">
-                  <input type="checkbox" id="pp" checked={pretty} onChange={e=>setPretty(e.target.checked)}/>
-                  <label htmlFor="pp">Pretty-print</label>
-                </div>
-                <pre className="json-viewer">
-                  {pretty ? JSON.stringify(data, null, 2) : JSON.stringify(data)}
-                </pre>
-              </>}
-            </>}
-            {/* ── Agent Run tab ──────────────────────────────────────── */}
-            {tab === "agent" && <>
-              <div className="action-card">
-                <label className="editor-label">Agent Configuration</label>
-                <div className="agent-info">
-                  <div>Strategy: <span>Epsilon-Greedy Q-Learning</span></div>
-                  <div>Episodes: <span>5</span></div>
-                  <div>Max Steps/Episode: <span>10</span></div>
-                  <div>Learning Rate: <span>0.1</span></div>
-                  <div>Task: <span>{task}</span></div>
-                </div>
-                <div className="btn-row">
-                  <button className="btn primary" onClick={handleAgentRun}  disabled={loading}>🚀 Run Agent</button>
-                  <button className="btn"          onClick={handleAgentPlan} disabled={loading}>📋 View Plan</button>
-                </div>
-              </div>
-              <div className="status-card">
-                <div className="status-label">Agent Status</div>
-                <div className={"status-text "+status.type}>{status.text || "Ready to run"}</div>
-              </div>
-              {data && <>
-                <div className="pp-row">
-                  <input type="checkbox" id="pp2" checked={pretty} onChange={e=>setPretty(e.target.checked)}/>
-                  <label htmlFor="pp2">Pretty-print</label>
-                </div>
-                <pre className="json-viewer" style={{maxHeight:"540px"}}>
-                  {pretty ? JSON.stringify(data, null, 2) : JSON.stringify(data)}
-                </pre>
-              </>}
-            </>}
-          </div>
-        </div>
-      </div>
-    </>
-  );
-}
-ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
-</script>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState } = React;
+        function App() {
+            const [task, setTask] = useState('task1');
+            const [tab, setTab] = useState('manual');
+            const [action, setAction] = useState(JSON.stringify({action_type: 'delete_resource', resource_id: ''}, null, 2));
+            const [status, setStatus] = useState({ text: '', type: 'info' });
+            const [response, setResponse] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [prettyPrint, setPrettyPrint] = useState(true);
+            const [taskScore, setTaskScore] = useState(0);
+            const [deletedResources, setDeletedResources] = useState([]);
+            const [manualActionHistory, setManualActionHistory] = useState([]);
+            const [stepCount, setStepCount] = useState(0);
+
+            const taskDescriptions = {
+                task1: "Task 1 (Easy): Delete unattached volumes and idle test instances.",
+                task2: "Task 2 (Medium): Right-size underutilized compute instances.",
+                task3: "Task 3 (Hard): Combine deletes, right-sizing, and savings plans."
+            };
+            const taskIdMap = {
+                task1: "cleanup_unattached",
+                task2: "rightsize_compute",
+                task3: "fleet_strategy"
+            };
+
+            const defaultActionByTask = {
+                task1: { action_type: "delete_resource", resource_id: "" },
+                task2: { action_type: "modify_instance", instance_id: "", new_type: "t3.small" },
+                task3: { action_type: "purchase_savings_plan", plan_type: "compute", duration: "1y" }
+            };
+
+            const suggestNextAction = (currentTask, observation) => {
+                const inventory = observation?.inventory || [];
+                if (!inventory.length) return defaultActionByTask[currentTask];
+
+                if (currentTask === "task1") {
+                    const unattached = inventory.find(r => r.category === "storage" && !r.is_attached);
+                    if (unattached) return { action_type: "delete_resource", resource_id: unattached.id };
+                    const idleTest = inventory.find(r => r.category === "compute" && r?.tags?.lifecycle === "idle");
+                    if (idleTest) return { action_type: "delete_resource", resource_id: idleTest.id };
+                    return defaultActionByTask[currentTask];
+                }
+
+                if (currentTask === "task2") {
+                    const underutilized = inventory.find(
+                        r => r.category === "compute" && Number(r.cpu_usage_pct_30d || 0) < 5.0 && r.resource_type !== "t3.small"
+                    );
+                    if (underutilized) {
+                        return { action_type: "modify_instance", instance_id: underutilized.id, new_type: "t3.small" };
+                    }
+                    return defaultActionByTask[currentTask];
+                }
+
+                const legacyNonProd = inventory.find(r => r.is_legacy && !r.is_production);
+                if (legacyNonProd) return { action_type: "delete_resource", resource_id: legacyNonProd.id };
+                const unattached = inventory.find(r => r.category === "storage" && !r.is_attached);
+                if (unattached) return { action_type: "delete_resource", resource_id: unattached.id };
+                const idleTest = inventory.find(r => r.category === "compute" && r?.tags?.lifecycle === "idle");
+                if (idleTest) return { action_type: "delete_resource", resource_id: idleTest.id };
+                const underutilized = inventory.find(
+                    r => r.category === "compute" && Number(r.cpu_usage_pct_30d || 0) < 5.0 && r.resource_type !== "t3.small"
+                );
+                if (underutilized) return { action_type: "modify_instance", instance_id: underutilized.id, new_type: "t3.small" };
+                return defaultActionByTask[currentTask];
+            };
+
+            const fetchTaskScore = async (currentTask = task) => {
+                try {
+                    const taskId = taskIdMap[currentTask];
+                    const resp = await fetch(`/tasks/${taskId}/score`);
+                    const data = await resp.json();
+                    if (resp.ok && typeof data?.score === "number") {
+                        setTaskScore(data.score);
+                    }
+                } catch (err) {
+                    console.error("Score fetch failed", err);
+                }
+            };
+
+            const apiCall = async (method, endpoint, payload = null) => {
+                setLoading(true);
+                setStatus({ text: 'Loading...', type: 'info' });
+                try {
+                    const options = { method, headers: { 'Content-Type': 'application/json' } };
+                    if (payload) options.body = JSON.stringify(payload);
+                    const resp = await fetch(endpoint, options);
+                    const data = await resp.json();
+                    if (!resp.ok) throw new Error(data?.detail || `API error: ${resp.status}`);
+                    setResponse(data);
+                    setStatus({ text: 'Success ✓', type: 'success' });
+                    return data;
+                } catch (err) {
+                    console.error(err);
+                    setStatus({ text: `Error: ${err.message}`, type: 'error' });
+                    setResponse(null);
+                    return null;
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const handleReset = async () => {
+                const data = await apiCall('POST', '/reset');
+                if (data?.observation) {
+                    const nextAction = suggestNextAction(task, data.observation);
+                    setAction(JSON.stringify(nextAction, null, 2));
+                    setDeletedResources([]);
+                    setManualActionHistory([]);
+                    setStepCount(0);
+                }
+                await fetchTaskScore();
+            };
+            const handleState = async () => {
+                const data = await apiCall('GET', '/state');
+                if (data?.observation) {
+                    const nextAction = suggestNextAction(task, data.observation);
+                    setAction(JSON.stringify(nextAction, null, 2));
+                }
+                await fetchTaskScore();
+            };
+            const handleStep = async () => {
+                try {
+                    const parsed = JSON.parse(action);
+                    const data = await apiCall('POST', '/step', parsed);
+                    if (data?.observation) {
+                        const newStep = stepCount + 1;
+                        setStepCount(newStep);
+                        if (parsed.action_type === 'delete_resource') {
+                            setDeletedResources([...deletedResources, parsed.resource_id]);
+                        }
+                        const historyEntry = {
+                            step: newStep,
+                            action: parsed,
+                            reward: data.reward,
+                            bill: data.bill,
+                            latency_ms: data.latency,
+                            status_message: data.status_message,
+                            inventory_count: data.observation?.inventory?.length || 0
+                        };
+                        setManualActionHistory([...manualActionHistory, historyEntry]);
+                        const nextAction = suggestNextAction(task, data.observation);
+                        setAction(JSON.stringify(nextAction, null, 2));
+                    }
+                    await fetchTaskScore();
+                } catch (e) {
+                    setStatus({ text: 'Invalid JSON in action editor', type: 'error' });
+                }
+            };
+
+            const handleAgentRun = async () => {
+                setResponse(null);
+                setStatus({ text: 'Running agent...', type: 'info' });
+                await apiCall('POST', '/agent/run', {task: task, episodes: 5, max_steps: 25});
+            };
+
+            const buildAgentSummary = (agentResp) => {
+                const logs = agentResp?.episode_logs || [];
+                const allSteps = logs.flatMap(ep => ep.steps || []);
+                const latestEpisode = logs.length ? logs[logs.length - 1] : null;
+                const avgLatency = allSteps.length
+                    ? allSteps.reduce((sum, s) => sum + Number(s.latency_ms || 0), 0) / allSteps.length
+                    : 0;
+                const maxThrottle = allSteps.length
+                    ? Math.max(...allSteps.map(s => Number(s?.info?.throttling_events ?? s?.observation?.health_status?.throttling_events ?? 0)), 0)
+                    : 0;
+                const maxDowntime = allSteps.length
+                    ? Math.max(...allSteps.map(s => Number(s?.info?.downtime_events ?? s?.observation?.health_status?.downtime_events ?? 0)), 0)
+                    : 0;
+                return {
+                    episodes: logs.length,
+                    totalReward: Number(agentResp?.total_reward || 0),
+                    avgReward: Number(agentResp?.average_reward || 0),
+                    bestScore: Number(agentResp?.best_episode_score || 0),
+                    bestCostCut: Number(agentResp?.best_episode_cost_reduction_pct || 0),
+                    avgLatency,
+                    maxThrottle,
+                    maxDowntime,
+                    latestSteps: latestEpisode?.steps || [],
+                };
+            };
+
+            const InventoryTable = ({ inventory }) => {
+                const visibleResources = inventory.filter(r => !deletedResources.includes(r.id));
+                
+                const getResourceBadges = (resource) => {
+                    const badges = [];
+                    if (resource.category === 'compute') badges.push(<span key="compute" className="resource-badge badge-compute">Compute</span>);
+                    else if (resource.category === 'storage') badges.push(<span key="storage" className="resource-badge badge-storage">Storage</span>);
+                    else if (resource.category === 'database') badges.push(<span key="database" className="resource-badge badge-database">Database</span>);
+                    
+                    if (!resource.is_attached) badges.push(<span key="unattached" className="resource-badge badge-unattached">Unattached</span>);
+                    if (resource.tags?.lifecycle === 'idle') badges.push(<span key="idle" className="resource-badge badge-idle">Idle</span>);
+                    if (resource.is_legacy) badges.push(<span key="legacy" className="resource-badge badge-legacy">Legacy</span>);
+                    if (resource.is_production) badges.push(<span key="prod" className="resource-badge badge-production">Production</span>);
+                    
+                    return badges;
+                };
+
+                return (
+                    <div className="inventory-section">
+                        <label className="inventory-label">Cloud Resources ({visibleResources.length} active)</label>
+                        <div className="inventory-table-wrap">
+                            <table className="inventory-table">
+                                <thead>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>Category</th>
+                                        <th>Type</th>
+                                        <th>Cost/mo</th>
+                                        <th>CPU %</th>
+                                        <th>Memory %</th>
+                                        <th>Network Mbps</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {visibleResources.map(resource => (
+                                        <tr key={resource.id}>
+                                            <td style={{fontSize: '11px', fontFamily: 'monospace'}}>{resource.id}</td>
+                                            <td>{resource.category}</td>
+                                            <td>{resource.resource_type}</td>
+                                            <td>${resource.monthly_cost?.toFixed(2) || '0.00'}</td>
+                                            <td>{Number(resource.cpu_usage_pct_30d || 0).toFixed(1)}%</td>
+                                            <td>{Number(resource.memory_usage_pct_30d || 0).toFixed(1)}%</td>
+                                            <td>{Number(resource.network_io_mbps_30d || 0).toFixed(1)}</td>
+                                            <td style={{whiteSpace: 'normal', wordBreak: 'break-word'}}>{getResourceBadges(resource)}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                );
+            };
+
+            return (
+                <>
+                    <div className="header">
+                        <div className="header-left">
+                            <div className="header-title">FinOps</div>
+                            <div className="header-badge">Cloud Optimizer</div>
+                        </div>
+                        <div className="header-right"><div className="stage-badge">Stage: {task}</div></div>
+                    </div>
+                    <div className="container">
+                        <div className="sidebar">
+                            <div className="task-label">Select Task</div>
+                            <div className="task-buttons">
+                                {['task1', 'task2', 'task3'].map(t => (
+                                    <button
+                                        key={t}
+                                        className={`task-btn ${task === t ? 'active' : ''}`}
+                                        onClick={async () => {
+                                            setTask(t);
+                                            const nextAction = suggestNextAction(t, response?.observation);
+                                            setAction(JSON.stringify(nextAction, null, 2));
+                                            await fetchTaskScore(t);
+                                        }}
+                                    >
+                                        {t.replace('task', 'T')}
+                                    </button>
+                                ))}
+                            </div>
+                            <div className="task-desc">{taskDescriptions[task]}</div>
+                            <hr className="sidebar-divider" />
+                            <div className="task-label">Example Action</div>
+                            <div className="code-snippet">{`{\\n  "action_type": "delete_resource",\\n  "resource_id": "i-0abc123"\\n}`}</div>
+                        </div>
+                        <div className="main-content">
+                            <div className="tabs">
+                                {['manual', 'agent'].map(t => (
+                                    <button key={t} className={`tab ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>
+                                        {t === 'manual' ? 'Manual Play' : 'Agent Run'}
+                                    </button>
+                                ))}
+                            </div>
+                            <div className="content">
+                                {tab === 'manual' && (
+                                    <>
+                                        <div className="metrics-row">
+                                            <div className="metric">
+                                                <div className="metric-label">Bill Amount</div>
+                                                <div className="metric-value">${response?.observation?.cost_data?.projected_monthly_bill ? response.observation.cost_data.projected_monthly_bill.toFixed(2) : '0.00'}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Latency (ms)</div>
+                                                <div className="metric-value">{response?.observation?.health_status?.system_latency_ms ? response.observation.health_status.system_latency_ms.toFixed(1) : '0'}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Throttling</div>
+                                                <div className="metric-value">{response?.observation?.health_status?.throttling_events ?? 0}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Downtime</div>
+                                                <div className="metric-value">{response?.observation?.health_status?.downtime_events ?? 0}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Reward</div>
+                                                <div className="metric-value">{response?.reward ? response.reward.toFixed(3) : '0.000'}</div>
+                                            </div>
+                                            <div className="metric">
+                                                <div className="metric-label">Task Score</div>
+                                                <div className="metric-value">{taskScore.toFixed(2)} ({(taskScore * 100).toFixed(0)}%)</div>
+                                            </div>
+                                        </div>
+                                        {response?.observation?.inventory && (
+                                            <InventoryTable inventory={response.observation.inventory} />
+                                        )}
+                                        <div className="action-editor">
+                                            <label className="editor-label">Action (JSON)</label>
+                                            <textarea value={action} onChange={(e) => setAction(e.target.value)} disabled={loading} />
+                                            <div className="button-group">
+                                                <button className="primary" onClick={handleStep} disabled={loading}>▶ Step</button>
+                                                <button onClick={handleReset} disabled={loading}>↺ Reset</button>
+                                                <button onClick={handleState} disabled={loading}>ℹ State</button>
+                                            </div>
+                                        </div>
+                                        <div className="status-box">
+                                            <div className="status-label">Status</div>
+                                            <div className={`status-message ${status.type === 'error' ? 'error' : ''}`}>
+                                                {status.text || 'Ready'}
+                                            </div>
+                                        </div>
+                                        {manualActionHistory.length > 0 && (
+                                            <>
+                                                <label className="editor-label">Action History ({manualActionHistory.length} steps)</label>
+                                                <div className="agent-table-wrap">
+                                                    <table className="agent-table">
+                                                        <thead>
+                                                            <tr>
+                                                                <th>Step</th>
+                                                                <th>Action</th>
+                                                                <th>Reward</th>
+                                                                <th>Bill</th>
+                                                                <th>Latency</th>
+                                                                <th>Resources</th>
+                                                                <th>Status</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            {manualActionHistory.map((entry, idx) => (
+                                                                <tr key={`manual-${idx}`}>
+                                                                    <td>{entry.step}</td>
+                                                                    <td>{entry.action?.action_type || "n/a"}</td>
+                                                                    <td>{Number(entry.reward || 0).toFixed(3)}</td>
+                                                                    <td>${Number(entry.bill || 0).toFixed(2)}</td>
+                                                                    <td>{Number(entry.latency_ms || 0).toFixed(1)}ms</td>
+                                                                    <td>{entry.inventory_count}</td>
+                                                                    <td>{entry.status_message || "ok"}</td>
+                                                                </tr>
+                                                            ))}
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            </>
+                                        )}
+                                        {response && (
+                                            <>
+                                                <div className="checkbox-group">
+                                                    <input type="checkbox" id="pretty" checked={prettyPrint} onChange={(e) => setPrettyPrint(e.target.checked)} />
+                                                    <label htmlFor="pretty">Pretty Print</label>
+                                                </div>
+                                                <div className="json-viewer">
+                                                    {prettyPrint ? JSON.stringify(response, null, 2) : JSON.stringify(response)}
+                                                </div>
+                                            </>
+                                        )}
+                                    </>
+                                )}
+                                {tab === 'agent' && (
+                                    <>
+                                        <div className="action-editor">
+                                            <label className="editor-label">Agent Configuration</label>
+                                            <div style={{fontSize: '13px', color: '#666', marginBottom: '12px'}}>
+                                                <div>Strategy: Task-aware cost optimizer</div>
+                                                <div>Episodes: 5</div>
+                                                <div>Max Steps/Episode: 25</div>
+                                                <div>Objective: Reduce bill while managing latency/throttling/downtime</div>
+                                            </div>
+                                            <div className="button-group">
+                                                <button className="primary" onClick={handleAgentRun} disabled={loading}>
+                                                    🚀 Run Agent
+                                                </button>
+                                                <button onClick={() => apiCall('GET', '/agent/plan')} disabled={loading}>📋 View Plan</button>
+                                            </div>
+                                        </div>
+                                        <div className="status-box">
+                                            <div className="status-label">Agent Status</div>
+                                            <div className={`status-message ${status.type === 'error' ? 'error' : ''}`}>
+                                                {status.text || 'Ready to run'}
+                                            </div>
+                                        </div>
+                                        {response && (
+                                            <>
+                                                {(() => {
+                                                    const summary = buildAgentSummary(response);
+                                                    return (
+                                                        <>
+                                                            <label className="editor-label">Agent Results</label>
+                                                            <div className="agent-summary-grid">
+                                                                <div className="agent-summary-card"><div className="agent-summary-label">Episodes</div><div className="agent-summary-value">{summary.episodes}</div></div>
+                                                                <div className="agent-summary-card"><div className="agent-summary-label">Best Task Score</div><div className="agent-summary-value">{summary.bestScore.toFixed(2)}</div></div>
+                                                                <div className="agent-summary-card"><div className="agent-summary-label">Best Cost Cut</div><div className="agent-summary-value">{summary.bestCostCut.toFixed(1)}%</div></div>
+                                                                <div className="agent-summary-card"><div className="agent-summary-label">Avg Latency</div><div className="agent-summary-value">{summary.avgLatency.toFixed(1)}ms</div></div>
+                                                                <div className="agent-summary-card"><div className="agent-summary-label">Max Throttle</div><div className="agent-summary-value">{summary.maxThrottle}</div></div>
+                                                                <div className="agent-summary-card"><div className="agent-summary-label">Max Downtime</div><div className="agent-summary-value">{summary.maxDowntime}</div></div>
+                                                                <div className="agent-summary-card"><div className="agent-summary-label">Total Reward</div><div className="agent-summary-value">{summary.totalReward.toFixed(2)}</div></div>
+                                                                <div className="agent-summary-card"><div className="agent-summary-label">Avg Reward</div><div className="agent-summary-value">{summary.avgReward.toFixed(2)}</div></div>
+                                                            </div>
+
+                                                            <label className="editor-label">Latest Episode Steps</label>
+                                                            <div className="agent-table-wrap">
+                                                                <table className="agent-table">
+                                                                    <thead>
+                                                                        <tr>
+                                                                            <th>Step</th>
+                                                                            <th>Action</th>
+                                                                            <th>Reward</th>
+                                                                            <th>Bill</th>
+                                                                            <th>Latency</th>
+                                                                            <th>Status</th>
+                                                                        </tr>
+                                                                    </thead>
+                                                                    <tbody>
+                                                                        {summary.latestSteps.map((s, idx) => (
+                                                                            <tr key={`${s.step}-${idx}`}>
+                                                                                <td>{s.step}</td>
+                                                                                <td>{s.action?.action_type || "n/a"}</td>
+                                                                                <td>{Number(s.reward || 0).toFixed(3)}</td>
+                                                                                <td>${Number(s.bill || 0).toFixed(2)}</td>
+                                                                                <td>{Number(s.latency_ms || 0).toFixed(1)}ms</td>
+                                                                                <td>{s.status_message || "ok"}</td>
+                                                                            </tr>
+                                                                        ))}
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+
+                                                            <details style={{marginTop: '10px'}}>
+                                                                <summary style={{cursor: 'pointer', fontSize: '12px', color: '#555'}}>View full raw logs (JSON)</summary>
+                                                                <div className="json-viewer" style={{maxHeight: '360px', marginTop: '8px'}}>
+                                                                    {prettyPrint ? JSON.stringify(response, null, 2) : JSON.stringify(response)}
+                                                                </div>
+                                                            </details>
+                                                        </>
+                                                    );
+                                                })()}
+                                            </>
+                                        )}
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </>
+            );
+        }
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 if __name__ == "__main__":
