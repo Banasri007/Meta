@@ -82,21 +82,6 @@ HTML_TEMPLATE = """
         .agent-table th, .agent-table td { padding: 8px 10px; font-size: 12px; border-bottom: 1px solid #f0f0f0; text-align: left; }
         .agent-table th { background: #fafafa; color: #666; font-weight: 600; }
         .agent-table-wrap { max-height: 280px; overflow: auto; border-radius: 8px; }
-        .inventory-section { margin-top: 20px; }
-        .inventory-label { font-size: 12px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; display: block; }
-        .inventory-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden; }
-        .inventory-table th, .inventory-table td { padding: 10px; font-size: 12px; border-bottom: 1px solid #f0f0f0; text-align: left; }
-        .inventory-table th { background: #fafafa; color: #666; font-weight: 600; }
-        .inventory-table-wrap { max-height: 400px; overflow: auto; border-radius: 8px; }
-        .resource-badge { display: inline-block; margin-right: 4px; padding: 2px 6px; font-size: 10px; border-radius: 3px; font-weight: 600; }
-        .badge-unattached { background: #fecaca; color: #991b1b; }
-        .badge-idle { background: #fed7aa; color: #92400e; }
-        .badge-legacy { background: #dbeafe; color: #1e40af; }
-        .badge-production { background: #dcfce7; color: #166534; }
-        .badge-compute { background: #e9d5ff; color: #6b21a8; }
-        .badge-storage { background: #fce7f3; color: #831843; }
-        .badge-database { background: #f3e8ff; color: #5b21b6; }
-        .resource-row-deleted { opacity: 0.5; background: #f9fafb; }
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-track { background: #f5f5f5; }
         ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 4px; }
@@ -116,9 +101,6 @@ HTML_TEMPLATE = """
             const [loading, setLoading] = useState(false);
             const [prettyPrint, setPrettyPrint] = useState(true);
             const [taskScore, setTaskScore] = useState(0);
-            const [deletedResources, setDeletedResources] = useState([]);
-            const [manualActionHistory, setManualActionHistory] = useState([]);
-            const [stepCount, setStepCount] = useState(0);
 
             const taskDescriptions = {
                 task1: "Task 1 (Easy): Delete unattached volumes and idle test instances.",
@@ -212,9 +194,6 @@ HTML_TEMPLATE = """
                 if (data?.observation) {
                     const nextAction = suggestNextAction(task, data.observation);
                     setAction(JSON.stringify(nextAction, null, 2));
-                    setDeletedResources([]);
-                    setManualActionHistory([]);
-                    setStepCount(0);
                 }
                 await fetchTaskScore();
             };
@@ -231,21 +210,6 @@ HTML_TEMPLATE = """
                     const parsed = JSON.parse(action);
                     const data = await apiCall('POST', '/step', parsed);
                     if (data?.observation) {
-                        const newStep = stepCount + 1;
-                        setStepCount(newStep);
-                        if (parsed.action_type === 'delete_resource') {
-                            setDeletedResources([...deletedResources, parsed.resource_id]);
-                        }
-                        const historyEntry = {
-                            step: newStep,
-                            action: parsed,
-                            reward: data.reward,
-                            bill: data.bill,
-                            latency_ms: data.latency,
-                            status_message: data.status_message,
-                            inventory_count: data.observation?.inventory?.length || 0
-                        };
-                        setManualActionHistory([...manualActionHistory, historyEntry]);
                         const nextAction = suggestNextAction(task, data.observation);
                         setAction(JSON.stringify(nextAction, null, 2));
                     }
@@ -253,12 +217,6 @@ HTML_TEMPLATE = """
                 } catch (e) {
                     setStatus({ text: 'Invalid JSON in action editor', type: 'error' });
                 }
-            };
-
-            const handleAgentRun = async () => {
-                setResponse(null);
-                setStatus({ text: 'Running agent...', type: 'info' });
-                await apiCall('POST', '/agent/run', {task: task, episodes: 5, max_steps: 25});
             };
 
             const buildAgentSummary = (agentResp) => {
@@ -285,60 +243,6 @@ HTML_TEMPLATE = """
                     maxDowntime,
                     latestSteps: latestEpisode?.steps || [],
                 };
-            };
-
-            const InventoryTable = ({ inventory }) => {
-                const visibleResources = inventory.filter(r => !deletedResources.includes(r.id));
-                
-                const getResourceBadges = (resource) => {
-                    const badges = [];
-                    if (resource.category === 'compute') badges.push(<span key="compute" className="resource-badge badge-compute">Compute</span>);
-                    else if (resource.category === 'storage') badges.push(<span key="storage" className="resource-badge badge-storage">Storage</span>);
-                    else if (resource.category === 'database') badges.push(<span key="database" className="resource-badge badge-database">Database</span>);
-                    
-                    if (!resource.is_attached) badges.push(<span key="unattached" className="resource-badge badge-unattached">Unattached</span>);
-                    if (resource.tags?.lifecycle === 'idle') badges.push(<span key="idle" className="resource-badge badge-idle">Idle</span>);
-                    if (resource.is_legacy) badges.push(<span key="legacy" className="resource-badge badge-legacy">Legacy</span>);
-                    if (resource.is_production) badges.push(<span key="prod" className="resource-badge badge-production">Production</span>);
-                    
-                    return badges;
-                };
-
-                return (
-                    <div className="inventory-section">
-                        <label className="inventory-label">Cloud Resources ({visibleResources.length} active)</label>
-                        <div className="inventory-table-wrap">
-                            <table className="inventory-table">
-                                <thead>
-                                    <tr>
-                                        <th>ID</th>
-                                        <th>Category</th>
-                                        <th>Type</th>
-                                        <th>Cost/mo</th>
-                                        <th>CPU %</th>
-                                        <th>Memory %</th>
-                                        <th>Network Mbps</th>
-                                        <th>Status</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {visibleResources.map(resource => (
-                                        <tr key={resource.id}>
-                                            <td style={{fontSize: '11px', fontFamily: 'monospace'}}>{resource.id}</td>
-                                            <td>{resource.category}</td>
-                                            <td>{resource.resource_type}</td>
-                                            <td>${resource.monthly_cost?.toFixed(2) || '0.00'}</td>
-                                            <td>{Number(resource.cpu_usage_pct_30d || 0).toFixed(1)}%</td>
-                                            <td>{Number(resource.memory_usage_pct_30d || 0).toFixed(1)}%</td>
-                                            <td>{Number(resource.network_io_mbps_30d || 0).toFixed(1)}</td>
-                                            <td style={{whiteSpace: 'normal', wordBreak: 'break-word'}}>{getResourceBadges(resource)}</td>
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                );
             };
 
             return (
@@ -411,9 +315,6 @@ HTML_TEMPLATE = """
                                                 <div className="metric-value">{taskScore.toFixed(2)} ({(taskScore * 100).toFixed(0)}%)</div>
                                             </div>
                                         </div>
-                                        {response?.observation?.inventory && (
-                                            <InventoryTable inventory={response.observation.inventory} />
-                                        )}
                                         <div className="action-editor">
                                             <label className="editor-label">Action (JSON)</label>
                                             <textarea value={action} onChange={(e) => setAction(e.target.value)} disabled={loading} />
@@ -429,39 +330,6 @@ HTML_TEMPLATE = """
                                                 {status.text || 'Ready'}
                                             </div>
                                         </div>
-                                        {manualActionHistory.length > 0 && (
-                                            <>
-                                                <label className="editor-label">Action History ({manualActionHistory.length} steps)</label>
-                                                <div className="agent-table-wrap">
-                                                    <table className="agent-table">
-                                                        <thead>
-                                                            <tr>
-                                                                <th>Step</th>
-                                                                <th>Action</th>
-                                                                <th>Reward</th>
-                                                                <th>Bill</th>
-                                                                <th>Latency</th>
-                                                                <th>Resources</th>
-                                                                <th>Status</th>
-                                                            </tr>
-                                                        </thead>
-                                                        <tbody>
-                                                            {manualActionHistory.map((entry, idx) => (
-                                                                <tr key={`manual-${idx}`}>
-                                                                    <td>{entry.step}</td>
-                                                                    <td>{entry.action?.action_type || "n/a"}</td>
-                                                                    <td>{Number(entry.reward || 0).toFixed(3)}</td>
-                                                                    <td>${Number(entry.bill || 0).toFixed(2)}</td>
-                                                                    <td>{Number(entry.latency_ms || 0).toFixed(1)}ms</td>
-                                                                    <td>{entry.inventory_count}</td>
-                                                                    <td>{entry.status_message || "ok"}</td>
-                                                                </tr>
-                                                            ))}
-                                                        </tbody>
-                                                    </table>
-                                                </div>
-                                            </>
-                                        )}
                                         {response && (
                                             <>
                                                 <div className="checkbox-group">
@@ -486,7 +354,7 @@ HTML_TEMPLATE = """
                                                 <div>Objective: Reduce bill while managing latency/throttling/downtime</div>
                                             </div>
                                             <div className="button-group">
-                                                <button className="primary" onClick={handleAgentRun} disabled={loading}>
+                                                <button className="primary" onClick={() => apiCall('POST', '/agent/run', {task: task, episodes: 5, max_steps: 25})} disabled={loading}>
                                                     🚀 Run Agent
                                                 </button>
                                                 <button onClick={() => apiCall('GET', '/agent/plan')} disabled={loading}>📋 View Plan</button>
@@ -598,28 +466,16 @@ async def root():
 
 @app.post("/reset")
 async def reset():
-    """Reset environment"""
+    """Reset environment — returns raw Observation (OpenEnv spec)"""
     initial_obs = env.reset()
-    obs_dict = initial_obs.model_dump() if hasattr(initial_obs, 'model_dump') else initial_obs.dict()
-    return {
-        "observation": obs_dict,
-        "reward": 0.0,
-        "done": False,
-        "info": {}
-    }
+    return initial_obs
 
 
 @app.get("/reset")
 async def reset_get():
     """Browser-friendly reset alias (GET)."""
     initial_obs = env.reset()
-    obs_dict = initial_obs.model_dump() if hasattr(initial_obs, 'model_dump') else initial_obs.dict()
-    return {
-        "observation": obs_dict,
-        "reward": 0.0,
-        "done": False,
-        "info": {}
-    }
+    return initial_obs
 
 @app.post("/step")
 async def step(action: Action):
@@ -627,12 +483,14 @@ async def step(action: Action):
     try:
         obs, reward, done, info = env.step(action)
         reward_val = float(reward.total if hasattr(reward, 'total') else reward)
-        obs_dict = obs.model_dump() if hasattr(obs, 'model_dump') else obs.dict()
         return {
-            "observation": obs_dict,
+            "observation": obs.dict() if hasattr(obs, 'dict') else obs,
             "reward": reward_val,
             "done": bool(done),
-            "info": info if isinstance(info, dict) else {}
+            "info": info if isinstance(info, dict) else {},
+            "bill": obs.cost_data.projected_monthly_bill if hasattr(obs, 'cost_data') else 0.0,
+            "latency": obs.health_status.system_latency_ms if hasattr(obs, 'health_status') else 0.0,
+            "status_message": obs.status_message if hasattr(obs, 'status_message') else ""
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -641,12 +499,12 @@ async def step(action: Action):
 async def state():
     """Get current state"""
     obs = env.get_observation("Current state requested.")
-    obs_dict = obs.model_dump() if hasattr(obs, 'model_dump') else obs.dict()
     return {
-        "observation": obs_dict,
-        "reward": 0.0,
-        "done": False,
-        "info": {}
+        "observation": obs.dict() if hasattr(obs, 'dict') else obs,
+        "step": env.step_count,
+        "bill": obs.cost_data.projected_monthly_bill if hasattr(obs, 'cost_data') else 0.0,
+        "latency": obs.health_status.system_latency_ms if hasattr(obs, 'health_status') else 0.0,
+        "status_message": obs.status_message if hasattr(obs, 'status_message') else ""
     }
 
 @app.get("/tasks")
@@ -861,4 +719,5 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
+>>>>>>> c4a9f3b (Fix POST /reset to return raw Observation per OpenEnv spec)
     uvicorn.run(app, host="0.0.0.0", port=7860)

@@ -1,2 +1,14 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Env files
 .env
 finops-env/.env
+
+# Virtual environments
+venv/
+env/
+
+# OS files
+.DS_Store
