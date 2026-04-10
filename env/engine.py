@@ -36,8 +36,8 @@ class FinOpsEngine:
     }
 
     def __init__(self) -> None:
-        seed_text = os.getenv("FINOPS_SEED")
-        self.seed: Optional[int] = int(seed_text) if seed_text and seed_text.strip() else None
+        seed_text = os.getenv("FINOPS_SEED", "42")
+        self.seed: Optional[int] = int(seed_text) if seed_text and seed_text.strip() else 42
         self.rng = random.Random(self.seed) if self.seed is not None else random.Random()
         self.resources: List[CloudResource] = []
         self.system_latency_ms: float = 80.0
@@ -48,7 +48,7 @@ class FinOpsEngine:
         self.throttling_events: int = 0
         self.downtime_events: int = 0
         self.critical_failures: int = 0
-        self.change_pressure: float = 0.0
+        self.change_pressure: float = 0.0  # Rises with each infra change
         self.savings_plans: List[SavingsPlan] = []
         self.baseline_cost_by_id: Dict[str, float] = {}
         self.underutilized_vm_ids: List[str] = []
@@ -202,17 +202,23 @@ class FinOpsEngine:
         )
         return self.get_observation("Environment reset. Optimization opportunities loaded.")
 
+    def state(self) -> Observation:
+        """Return the current observable environment state without mutation."""
+        return self.get_observation("Current state requested.")
+
     def step(self, action: Action) -> Tuple[Observation, Reward, bool, dict]:
         self.step_count += 1
         previous_bill = self.get_effective_bill()
         action_reward = 0.0
         status_message = "No-op."
-        info: Dict[str, float] = {}
+        info: Dict = {}
 
         if isinstance(action, DeleteResourceAction):
             action_reward, status_message = self._handle_delete(action)
+            self.change_pressure = min(5.0, self.change_pressure + 0.4)
         elif isinstance(action, ModifyInstanceAction):
             action_reward, status_message = self._handle_modify(action)
+            self.change_pressure = min(5.0, self.change_pressure + 0.8)
         elif isinstance(action, PurchaseSavingsPlanAction):
             action_reward, status_message = self._handle_savings_plan(action)
         elif isinstance(action, TagResourceAction):
@@ -222,7 +228,7 @@ class FinOpsEngine:
         current_bill = self.get_effective_bill()
         bill_delta = previous_bill - current_bill
 
-        # Progress signal from the spec: positive when projected bill decreases.
+        # Progress signal: positive when projected bill decreases.
         bill_change_reward = bill_delta / 200.0
         reward_total = action_reward + bill_change_reward
         reward = Reward(
@@ -235,8 +241,8 @@ class FinOpsEngine:
         info["monthly_bill_delta"] = round(bill_delta, 2)
         info["effective_monthly_bill"] = round(current_bill, 2)
         info["system_latency_ms"] = round(self.system_latency_ms, 2)
-        info["throttling_events"] = int(self.throttling_events)
-        info["downtime_events"] = int(self.downtime_events)
+        info["throttling_events"] = self.throttling_events
+        info["downtime_events"] = self.downtime_events
 
         return self.get_observation(status_message), reward, done, info
 
@@ -248,6 +254,7 @@ class FinOpsEngine:
         if target.category == "database" and target.is_production:
             self.critical_failures += 1
             self.downtime_events += 1
+            self.system_latency_ms += 80.0  # Immediate latency spike
             return -1.0, "Critical failure: attempted deletion of production database blocked."
 
         reward = 0.0
@@ -256,10 +263,10 @@ class FinOpsEngine:
         if target.category == "compute" and target.tags.get("lifecycle") == "idle":
             reward += 0.1
         if target.is_production and target.category == "compute":
+            # Deleting production compute triggers throttling
+            self.throttling_events += 1
+            self.system_latency_ms += 30.0
             reward -= 0.2
-            self.change_pressure += 1.2
-        else:
-            self.change_pressure += 0.25
 
         self.resources = [resource for resource in self.resources if resource.id != target.id]
         return reward, f"Deleted resource {target.id}."
@@ -278,6 +285,7 @@ class FinOpsEngine:
         if current_profile is None:
             return -0.1, f"Current type {target.resource_type} is not resizable in this simulator."
 
+        old_type = target.resource_type
         old_cost = target.monthly_cost
         old_capacity = current_profile["capacity"]
         new_capacity = new_profile["capacity"]
@@ -289,24 +297,21 @@ class FinOpsEngine:
         target.memory_usage_pct_30d = min(100.0, target.memory_usage_pct_30d * (old_capacity / new_capacity))
 
         reward = max(0.0, (old_cost - target.monthly_cost) / 250.0)
-        self.change_pressure += 0.8
 
-        # Penalty from the spec if throttling occurs after resize.
+        # Penalty if throttling occurs after resize.
         if expected_cpu >= 100.0:
             self.throttling_events += 1
+            self.system_latency_ms += 25.0
             reward -= 0.5
-        elif target.is_production and expected_cpu >= 75.0:
-            # Production downsizing near saturation increases throttle risk.
+        elif expected_cpu >= 85.0 and target.is_production:
+            # Risky resize of production instance
             self.throttling_events += 1
+            self.system_latency_ms += 15.0
             reward -= 0.2
-
-        if target.is_production and expected_cpu >= 92.0:
-            self.downtime_events += 1
-            reward -= 0.4
 
         self._apply_resize_noise(target)
 
-        return reward, f"Modified {target.id} from {current_profile} to {action.new_type}."
+        return reward, f"Modified {target.id} from {old_type} to {action.new_type}."
 
     def _apply_resize_noise(self, modified_target: CloudResource) -> None:
         # Small stochastic drift after infra changes to mimic real workload variance.
@@ -356,24 +361,24 @@ class FinOpsEngine:
             if resource.category == "compute" and resource.is_production and resource.cpu_usage_pct_30d > 80.0
         ]
         severe_over_utilized = [resource for resource in over_utilized_production if resource.cpu_usage_pct_30d >= 100.0]
+
         latency_from_risk = len(over_utilized_production) * 28.0 + len(severe_over_utilized) * 45.0
-        latency_from_operational_churn = self.change_pressure * 4.5
-        self.system_latency_ms = (
-            self.base_latency_ms
-            + latency_from_risk
-            + latency_from_operational_churn
-            + (self.throttling_events * 12.0)
-            + (self.downtime_events * 30.0)
-        )
+        latency_from_churn = self.change_pressure * 8.0  # Churn from repeated infra changes
+        latency_from_throttle = self.throttling_events * 12.0
 
-        # SLO pressure side-effects.
-        if self.system_latency_ms >= 185.0:
+        computed = self.base_latency_ms + latency_from_risk + latency_from_churn + latency_from_throttle
+
+        # Clamp latency and apply decay — system stabilizes over time if no bad actions
+        self.system_latency_ms = min(computed, 800.0)
+        self.change_pressure = max(0.0, self.change_pressure - 0.1)  # Pressure decays slowly
+
+        # High latency auto-triggers throttling
+        if self.system_latency_ms > 400.0 and self.rng.random() < 0.3:
             self.throttling_events += 1
-        if self.system_latency_ms >= 240.0:
-            self.downtime_events += 1
 
-        # Pressure naturally decays between steps.
-        self.change_pressure = max(0.0, self.change_pressure * 0.85)
+        # Very high latency triggers downtime
+        if self.system_latency_ms > 600.0 and self.rng.random() < 0.2:
+            self.downtime_events += 1
 
     def _find_resource(self, resource_id: str) -> Optional[CloudResource]:
         return next((resource for resource in self.resources if resource.id == resource_id), None)
